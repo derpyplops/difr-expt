@@ -11,8 +11,10 @@ import torch
 import torch.nn as nn
 
 from difr_expt.int_cast import (
+    IntEmbedding,
     IntLinear,
     patch_model_int_cast,
+    patch_model_int_embedding,
     quantize_per_row,
     quantize_per_token,
     set_true_int_matmul,
@@ -184,6 +186,49 @@ def test_argmax_match_rate_toy():
     print(f"toy top-1 match: {match:.6f}")
     # 16-bit quant on a tiny untrained model: ≥99%.
     assert match >= 0.99, f"toy match rate too low: {match}"
+
+
+def test_int_embedding_close_to_float_at_b24():
+    torch.manual_seed(0)
+    vocab, d = 257, 64
+    emb = nn.Embedding(vocab, d)
+    emb.weight.data = torch.randn(vocab, d) * 0.05
+    int_emb = IntEmbedding.from_embedding(emb, bits=24)
+    ids = torch.randint(0, vocab, (4, 16))
+    out_ref = emb(ids)
+    out_int = int_emb(ids)
+    assert out_int.shape == out_ref.shape
+    assert out_int.dtype == out_ref.dtype
+    delta = (out_int.float() - out_ref.float()).abs().max().item()
+    # b=24 symmetric quant: per-element relative noise ~ 1/(2^23-1) ≈ 1.2e-7
+    assert delta < 1e-5, f"int_embedding delta too large: {delta}"
+
+
+def test_int_embedding_padding_idx_zeroed():
+    torch.manual_seed(0)
+    vocab, d = 32, 16
+    emb = nn.Embedding(vocab, d, padding_idx=0)
+    emb.weight.data = torch.randn(vocab, d) * 0.1
+    int_emb = IntEmbedding.from_embedding(emb, bits=24)
+    ids = torch.tensor([[0, 5, 0, 7]])
+    out = int_emb(ids)
+    assert torch.all(out[0, 0] == 0)
+    assert torch.all(out[0, 2] == 0)
+    assert not torch.all(out[0, 1] == 0)
+
+
+def test_patch_model_int_embedding_replaces():
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Embedding(64, 32),
+        nn.Linear(32, 32),
+    )
+    replaced = patch_model_int_embedding(model, bits=24)
+    assert len(replaced) == 1
+    assert isinstance(model[0], IntEmbedding)
+    ids = torch.randint(0, 64, (2, 8))
+    out = model(ids)
+    assert out.shape == (2, 8, 32)
 
 
 if __name__ == "__main__":

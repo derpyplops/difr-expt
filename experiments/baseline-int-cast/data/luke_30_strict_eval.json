@@ -1,0 +1,46 @@
+{
+  "n_positions": 16345,
+  "n_prompts": 100,
+  "all": {
+    "top1_match": 0.9340471625328064,
+    "top5_overlap": 0.9289814233779907,
+    "logit_l2": 87.843505859375,
+    "kl_ref_cand": 0.025320598855614662,
+    "gumbel_margin": 0.027275826781988144,
+    "logit_l2_p50": 75.50867462158203,
+    "logit_l2_p99": 248.228271484375,
+    "logit_l2_max": 1160.7908935546875,
+    "kl_ref_cand_p50": 0.007841862738132477,
+    "kl_ref_cand_p99": 0.20129457116127014,
+    "kl_ref_cand_max": 6.550570487976074,
+    "gumbel_margin_p50": 0.0,
+    "gumbel_margin_p99": 0.440112441778183,
+    "gumbel_margin_max": 11.890645980834961
+  },
+  "last": {
+    "top1_match": 0.9099999666213989,
+    "top5_overlap": 0.8999999761581421,
+    "logit_l2": 92.78011322021484,
+    "kl_ref_cand": 0.017815792933106422,
+    "gumbel_margin": 0.006330346688628197,
+    "logit_l2_p50": 87.44456481933594,
+    "logit_l2_p99": 168.58616638183594,
+    "logit_l2_max": 225.09262084960938,
+    "kl_ref_cand_p50": 0.013366417959332466,
+    "kl_ref_cand_p99": 0.09558311849832535,
+    "kl_ref_cand_max": 0.14375987648963928,
+    "gumbel_margin_p50": 0.0,
+    "gumbel_margin_p99": 0.12092198431491852,
+    "gumbel_margin_max": 0.3687887191772461
+  },
+  "wallclock_s": 5.491907596588135,
+  "config": {
+    "model": "Qwen/Qwen2.5-0.5B",
+    "student_state": "/root/int-model-approximation/outputs/luke_default/student_state_dict.pt",
+    "dtype": "bfloat16",
+    "n_prompts": 100,
+    "max_len": 512,
+    "weight_bits": 16,
+    "activation_bits": 16
+  }
+}

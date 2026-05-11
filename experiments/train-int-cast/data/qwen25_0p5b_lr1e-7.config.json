@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "prompts": "prompts/qwen25.pt",
+  "out": "runs/qwen25_lr1e-7_v2",
+  "lr": 1e-07,
+  "steps": 5000,
+  "batch": 4,
+  "eval_every": 250,
+  "ckpt_every": 1000,
+  "warmup": 500,
+  "grad_clip": 1.0,
+  "weight_bits": 16,
+  "activation_bits": 16,
+  "dtype": "bfloat16",
+  "seed": 42,
+  "eight_bit_adam": false,
+  "eval_n_prompts": 100,
+  "eval_max_positions": 100000,
+  "temperature": 1.0
+}
