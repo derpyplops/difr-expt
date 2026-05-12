@@ -111,6 +111,7 @@ class Config:
     trainable_luts: bool = True
     int_embedding: bool = False
     embedding_bits: int = 24
+    int_lm_head: bool = False  # Match teacher convention (lm_head fp32)
 
 
 def set_seed(seed: int) -> None:
@@ -133,13 +134,23 @@ def promote_intlinear_biases(model: nn.Module) -> int:
 
 
 def promote_luts(model: nn.Module) -> tuple[int, int]:
+    """Promote softmax/silu LUTs to nn.Parameter and co-locate them with the
+    rest of the model. The init helpers (_build_exp_lut/_build_sigmoid_lut)
+    create CPU tensors; without the .to(device) move below, the LUT param
+    stays on CPU while everything else is on GPU. torch.optim.AdamW silently
+    tolerates the split (CPU updates, slow); bitsandbytes' 8-bit AdamW does
+    not — it requires same-device. So this fix is mandatory for 8B runs.
+    """
     n_sm, n_silu = 0, 0
+    device = next(model.parameters()).device
     for m in model.modules():
         if isinstance(m, IntSoftmaxModule) and m.lut is None:
             m.make_lut_trainable()
+            m.lut.data = m.lut.data.to(device)
             n_sm += 1
         elif isinstance(m, IntSiLUModule) and m.lut is None:
             m.make_lut_trainable()
+            m.lut.data = m.lut.data.to(device)
             n_silu += 1
     return n_sm, n_silu
 
@@ -295,6 +306,7 @@ def build_models(
     trainable_matmul_weights: bool,
     int_embedding: bool,
     embedding_bits: int,
+    int_lm_head: bool = False,
     keep_fp32_ref: bool = True,
     grad_checkpointing: bool = False,
 ) -> tuple[nn.Module, nn.Module, nn.Module | None]:
@@ -338,14 +350,19 @@ def build_models(
         p.requires_grad = False
 
     student = copy.deepcopy(base)
+    # Match teacher convention: published fp8/fp4 checkpoints leave lm_head in
+    # bf16/fp32. Mirroring that here keeps the comparison apples-to-apples and
+    # avoids ~2.5GB of fp32 shadows + ~10GB of forward transients on 8B (the
+    # lm_head matmul was the OOM trigger).
     replaced = patch_model_int_cast(
         student,
         weight_bits=weight_bits,
         activation_bits=activation_bits,
         trainable=trainable_matmul_weights,
+        include_lm_head=int_lm_head,
     )
     print(f"  student: replaced {len(replaced)} Linears with IntLinear "
-          f"(trainable={trainable_matmul_weights})")
+          f"(trainable={trainable_matmul_weights}, include_lm_head={int_lm_head})")
     ops_cfg = IntOpsConfig(
         rmsnorm_bits=rmsnorm_bits,
         softmax_lut_size=softmax_lut_size,
@@ -426,6 +443,10 @@ def main():
     ap.add_argument("--no-trainable-luts", action="store_true")
     ap.add_argument("--int-embedding", action="store_true")
     ap.add_argument("--embedding-bits", type=int, default=24)
+    ap.add_argument("--int-lm-head", action="store_true",
+                    help="Apply IntLinear to lm_head too. Default off — matches "
+                         "published-teacher convention (fp32 lm_head) and avoids ~10GB "
+                         "of forward transients on 8B.")
     ap.add_argument("--no-fp32-ref", action="store_true",
                     help="Don't keep an fp32 ref in memory (saves RAM on CPU runs).")
     args = ap.parse_args()
@@ -471,6 +492,7 @@ def main():
         trainable_luts=not args.no_trainable_luts,
         int_embedding=args.int_embedding,
         embedding_bits=args.embedding_bits,
+        int_lm_head=args.int_lm_head,
     )
     out_dir = Path(cfg.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +530,7 @@ def main():
         trainable_matmul_weights=cfg.trainable_matmul_weights,
         int_embedding=cfg.int_embedding,
         embedding_bits=cfg.embedding_bits,
+        int_lm_head=cfg.int_lm_head,
         keep_fp32_ref=not args.no_fp32_ref,
         grad_checkpointing=cfg.grad_checkpointing,
     )
