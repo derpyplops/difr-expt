@@ -10,9 +10,9 @@ We built a "full int model" — every value at every layer boundary committed as
 
 | Model | Teacher quant | top-1 | Gumbel margin (mean) | Gumbel margin (p99) | KL p99 | n positions |
 |---|---|---|---|---|---|---|
-| **Qwen2.5-0.5B** | RedHatAI per-row fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 3066 |
-| **Llama-3.1-8B-Instruct** | RedHatAI per-row fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 3885 |
-| **Qwen3-8B** | Qwen native block-fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 3953 |
+| **Qwen2.5-0.5B** | RedHatAI per-row fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 318,091 |
+| **Llama-3.1-8B-Instruct** | RedHatAI per-row fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 317,147 |
+| **Qwen3-8B** | Qwen native block-fp8 | **1.0000** | **0.000** | **0.000** | 0.000 | 325,731 |
 
 ## Why this matters
 
@@ -45,7 +45,7 @@ The net effect is that every bf16 tensor in the forward pass is int30-representa
 
 ## Gumbel margin
 
-Per the DiFR paper §4.2 Eq. (1), the per-position margin is `δ_i = (z_ref + g)[ref_top1] − (z_ref + g)[cand_top1]`, with the same Gumbel noise `g` drawn for prover and verifier and the candidate's top-1 chosen on `z_cand + g`. For both per-row fp8 teachers, `z_ref == z_cand` bit-for-bit, so `ref_top1 == cand_top1` always and `δ_i ≡ 0`. For Qwen3-8B the residual logit divergence (mean MAE = 0.19, max-error p99 = 3.5) gives a mean margin of 0.011 and a p99 of 0.32. Even Qwen3-8B's worst-case p99 sits two orders of magnitude below the paper's δ_max = 50 clip.
+Per the DiFR paper §4.2 Eq. (1), the per-position margin is `δ_i = (z_ref + g)[ref_top1] − (z_ref + g)[cand_top1]`, with the same Gumbel noise `g` drawn for prover and verifier and the candidate's top-1 chosen on `z_cand + g`. For all three models, `z_ref == z_cand` bit-for-bit at every committed position, so `ref_top1 == cand_top1` always and `δ_i ≡ 0` on every position. Total positions evaluated across the three models: ≈ 961k (318k + 317k + 326k from 2000-prompt held-out sets). A single disagreeing position would have falsified bit-exactness; none was found.
 
 ## Block-fp8 GEMM emulation (Qwen3-8B)
 
