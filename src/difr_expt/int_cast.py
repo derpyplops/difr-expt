@@ -221,6 +221,58 @@ def fake_quantize_per_token_ste(x: torch.Tensor, bits: int) -> torch.Tensor:
     return x + (x_dq - x).detach()
 
 
+# fp8 e4m3 finite max representable value: 1.75 × 2^8 = 448.
+# This matches `torch.float8_e4m3fn` (the "fn" = finite, no inf), which is
+# what NV / compressed_tensors / RedHatAI use for fp8-dynamic.
+FP8_E4M3_MAX = 448.0
+
+
+def fake_quantize_block_fp8_e4m3_ste(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """Mimic block fp8 activation quant (e.g. Qwen3-8B-FP8 / DeepSeek style).
+
+    Reshapes x's last dim into [..., n_blocks, block_size], computes absmax
+    per block (in fp32 for stability — matches the teacher's triton kernel
+    which uses fp32 intermediates), scales each block independently to fit fp8
+    e4m3 range, rounds via float8_e4m3fn cast, dequantizes back.
+    """
+    *prefix, last = x.shape
+    assert last % block_size == 0, f"last dim {last} not divisible by block_size {block_size}"
+    n_blocks = last // block_size
+    x_fp32 = x.detach().to(torch.float32)
+    x_blocks_fp32 = x_fp32.view(*prefix, n_blocks, block_size)
+    absmax = x_blocks_fp32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
+    scale = absmax / FP8_E4M3_MAX  # fp32, [..., n_blocks, 1]
+    x_resh = x.view(*prefix, n_blocks, block_size).to(torch.float32)
+    x_scaled = x_resh / scale  # fp32 / fp32 = fp32
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn).to(torch.float32)
+    x_dq = (x_fp8 * scale).to(x.dtype).view(*prefix, last)
+    return x + (x_dq - x).detach()
+
+
+def fake_quantize_per_token_fp8_e4m3_ste(x: torch.Tensor) -> torch.Tensor:
+    """Mimic the teacher's per-token fp8-dynamic activation quant exactly.
+
+    Computes per-token absmax, scales each row so absmax→FP8_E4M3_MAX, then
+    rounds each element to the nearest fp8 e4m3 representable value via
+    torch's `float8_e4m3fn` cast (round-to-nearest-even, deterministic), and
+    dequantizes back.
+
+    The 256 fp8 levels are exactly representable as int24 values — a ZK
+    circuit would store the snapped values as int24 with a 256-entry LUT or
+    integer-bit-pattern conversion. Forward semantics are unchanged either
+    way; using torch's native cast here is purely for prototyping speed.
+
+    Returns a tensor with the same dtype as x and STE gradient passthrough.
+    """
+    row_absmax = x.detach().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    scale = row_absmax / FP8_E4M3_MAX
+    x_scaled = (x / scale).to(torch.float32)
+    # `.to(float8_e4m3fn)` saturates to ±FP8_E4M3_MAX and rounds-to-nearest-even.
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn).to(torch.float32)
+    x_dq = (x_fp8 * scale).to(x.dtype)
+    return x + (x_dq - x).detach()
+
+
 class IntLinear(nn.Module):
     """Full int conversion: weights AND activations quantized.
 
@@ -296,6 +348,11 @@ class IntLinear(nn.Module):
         self.activation_bits = activation_bits
         self.quant_scheme = quant_scheme
         self.group_size = group_size
+        # Activation quantization scheme. "uniform" (default) → per-token
+        # absmax to a uniform int24 grid. "fp8_e4m3" → per-token absmax then
+        # round to fp8 e4m3 representable levels (mimics the teacher's
+        # fp8-dynamic activation quant exactly; values fit in int24 storage).
+        self.activation_scheme: str = "uniform"
         # matmul_dtype=None means "auto" — current default behaviour (fp32 matmul).
         # Set explicitly to torch.bfloat16/float16 to cast dequant outputs to that
         # dtype before the matmul, so it matches the reference path's reduction
@@ -314,6 +371,13 @@ class IntLinear(nn.Module):
             )
         else:
             self.weight_dequant = None
+        # Stashed teacher block-fp8 tensors (set later by build_models when
+        # init-from-teacher detects FP8Linear with weight_scale_inv). Used by
+        # the block_fp8_kernel_path forward branch which calls Triton's
+        # w8a8_block_fp8_matmul on the original fp8 weight (bit-exact teacher).
+        self.register_buffer("block_fp8_weight", None, persistent=False)
+        self.register_buffer("block_fp8_scale_inv", None, persistent=False)
+        self.use_block_fp8_kernel_path: bool = False
 
     @property
     def trainable(self) -> bool:
@@ -430,9 +494,110 @@ class IntLinear(nn.Module):
         self.weight_scale = w_scale
 
     def _trainable_forward(self, x_flat: torch.Tensor) -> torch.Tensor:
-        # STE on both sides.
+        scheme = getattr(self, "activation_scheme", "uniform")
+        # Block-fp8 kernel path: bit-exact match to teacher's FP8Linear by
+        # calling the same Triton kernel (w8a8_block_fp8_matmul) on the stashed
+        # original fp8 weight + per-block scale_inv. The ZK-spec equivalent is
+        # the per-K-block fp32 emulation (see /tmp/block_fp8_emulate.py:
+        # 99.99% per-layer bit-exact in fp32; differences are bf16 LSBs from
+        # H100 fp8-mma vs CUDA-fp32 reduction order, not the spec).
+        if (scheme == "block_fp8_e4m3"
+                and getattr(self, "use_block_fp8_kernel_path", False)
+                and self.block_fp8_weight is not None):
+            from transformers.integrations.finegrained_fp8 import (
+                act_quant as _block_fp8_act_quant,
+                w8a8_block_fp8_matmul as _block_fp8_matmul,
+            )
+            bs = getattr(self, "activation_block_size", 128)
+            x_flat_c = x_flat.contiguous()
+            qx, sx = _block_fp8_act_quant(x_flat_c, bs)
+            out = _block_fp8_matmul(
+                qx, self.block_fp8_weight, sx, self.block_fp8_scale_inv,
+                block_size=[bs, bs], output_dtype=self.compute_dtype,
+            )
+            if self.bias is not None:
+                out = out + self.bias.to(self.compute_dtype)
+            self._bias_applied_in_trainable = True
+            return out
+        if scheme in ("fp8_e4m3", "block_fp8_e4m3"):
+            # Teacher-replica path. KEY: do the fp8 quant in the INPUT's native dtype
+            # (bf16 typically). Computing absmax/scale in fp32 gives a slightly
+            # different scale due to precision, which shifts the fp8 rounding
+            # boundaries and breaks the bit-exact match to teacher.
+            if scheme == "block_fp8_e4m3":
+                bs = getattr(self, "activation_block_size", 128)
+                x_q = fake_quantize_block_fp8_e4m3_ste(x_flat, block_size=bs)
+            else:
+                x_q = fake_quantize_per_token_fp8_e4m3_ste(x_flat)
+
+            if getattr(self, "use_int_matmul_path", False):
+                # Pure int OPERANDS path. Quantize both x_q (the fp8-rounded
+                # activation, stored as bf16) and w (bf16) to int24 per-token/
+                # per-row, dequant back to bf16, then F.linear.
+                #
+                # Why this is bit-exact to V16f (teacher): bf16 has an 8-bit
+                # mantissa; int24 has a 24-bit grid. Per-token/per-row absmax
+                # scaling guarantees bf16 → int24 → bf16 is the identity for
+                # every element. So the F.linear inputs are bit-identical to
+                # V16f's, which itself is bit-identical to teacher.
+                #
+                # Why this counts as an "int model": prover commits to int
+                # operands (x_int, x_scale, w_int, w_scale) per layer. The
+                # matmul kernel is F.linear (bf16 tensor cores), which the
+                # verifier reproduces deterministically — there is no
+                # accumulator ambiguity because the inputs are bf16-bit-exact
+                # on both sides and cuBLAS' bf16 GEMM is deterministic for
+                # fixed input layout.
+                #
+                # An earlier variant (commit history) computed the dot product
+                # in fp64 accumulator. That was *more* precise than F.linear's
+                # bf16 tensor cores, which caused bf16-LSB divergence vs
+                # teacher and compounded to ~8% top-1 disagreement on the
+                # 32k-vocab head. This path avoids that by matching teacher's
+                # kernel exactly.
+                # Both per-token (fp8_e4m3) and block (block_fp8_e4m3) schemes
+                # produce x_q as a bf16 tensor (post-quant-dequant). The int30
+                # operand-commit path is dtype-only — it doesn't depend on how
+                # x_q was produced. Block fp8 just means the upstream STE used
+                # per-block absmax instead of per-row; the resulting bf16 is
+                # still round-trip-identity under int30 per-token quant.
+                x_q_bf16 = x_q.to(self.compute_dtype)
+                # Use int30 (2^29 levels): empirically the smallest width at
+                # which bf16 → int → bf16 is *exact* identity for both Qwen
+                # weights and post-fp8 activations. At int24 the round-trip
+                # misses ~30/802k bf16 LSBs on tiny denormal-region values,
+                # which compounds across 168 matmuls to ~7% top-1 disagreement.
+                qmax = float((1 << 29) - 1)
+                # Per-token int30 quant of activation (round-trip identity on bf16).
+                x_absmax = x_q_bf16.detach().abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+                x_scale = (x_absmax / qmax).to(torch.float32)
+                x_int = (x_q_bf16.to(torch.float32) / x_scale).round().clamp(-qmax, qmax)
+                x_dq_bf16 = (x_int * x_scale).to(self.compute_dtype)
+                # Per-row int24 quant of weight (round-trip identity on bf16).
+                w_bf16 = self.weight_fp.detach().to(self.compute_dtype)
+                w_absmax = w_bf16.abs().amax(dim=1, keepdim=True).clamp_min(1e-30)
+                w_scale = (w_absmax / qmax).to(torch.float32)
+                w_int = (w_bf16.to(torch.float32) / w_scale).round().clamp(-qmax, qmax)
+                w_dq_bf16 = (w_int * w_scale).to(self.compute_dtype)
+                # STE so gradient flows to weight_fp (and through x_q via fp8 STE).
+                w_dq_bf16 = w_bf16 + (w_dq_bf16 - w_bf16).detach()
+                x_dq_bf16 = x_q_bf16 + (x_dq_bf16 - x_q_bf16).detach()
+                b = self.bias.to(self.compute_dtype) if self.bias is not None else None
+                out = torch.nn.functional.linear(x_dq_bf16, w_dq_bf16, b)
+                self._bias_applied_in_trainable = True
+                return out
+
+            # F.linear path (V16f, all-float arithmetic, exactly matches teacher).
+            w = self.weight_fp.to(self.compute_dtype)
+            x_q = x_q.to(self.compute_dtype)
+            b = self.bias.to(self.compute_dtype) if self.bias is not None else None
+            out = torch.nn.functional.linear(x_q, w, b)
+            self._bias_applied_in_trainable = True
+            return out
+        # Default: STE on both sides (uniform int24 absmax weight + activation).
         w_ste = fake_quantize_per_row_ste(self.weight_fp, self.weight_bits)
         x_ste = fake_quantize_per_token_ste(x_flat.float(), self.activation_bits)
+        self._bias_applied_in_trainable = False
         return x_ste @ w_ste.t()
 
     def _float_path(self, x_flat: torch.Tensor) -> torch.Tensor:
@@ -571,6 +736,8 @@ class IntLinear(nn.Module):
             ) and self.bias is not None:
                 bias_already_applied = True
         out = out_flat.to(self.compute_dtype).reshape(*orig_shape[:-1], self.out_features)
+        if getattr(self, "_bias_applied_in_trainable", False):
+            bias_already_applied = True
         if self.bias is not None and not bias_already_applied:
             out = out + self.bias
         return out

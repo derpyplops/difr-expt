@@ -1,0 +1,50 @@
+[09:37:34] loading Qwen/Qwen2.5-0.5B (torch.bfloat16) on cuda
+Loading weights:   0%|          | 0/290 [00:00<?, ?it/s]Loading weights: 100%|██████████| 290/290 [00:00<00:00, 7788.47it/s]
+Compressing model: 0it [00:00, ?it/s]Compressing model: 168it [00:00, 2421.00it/s]
+Loading weights:   0%|          | 0/459 [00:00<?, ?it/s]Loading weights: 100%|██████████| 459/459 [00:00<00:00, 7826.08it/s]
+The tied weights mapping and config for this model specifies to tie model.embed_tokens.weight to lm_head.weight, but both are present in the checkpoints, so we will NOT tie them. You should update the config with `tie_word_embeddings=False` to silence this warning
+  teacher: loaded published checkpoint RedHatAI/Qwen2.5-0.5B-FP8-dynamic
+  init_from_teacher: copied 169 weight tensors from teacher into base
+  student: replaced 168 Linears with IntLinear (trainable=True, include_lm_head=False)
+  student: int non-matmul counts: {'rmsnorm': 49, 'silu': 24, 'attention': 24}
+  promoted 72 biases to nn.Parameter
+  per-matmul hooks: paired 168 student↔teacher Linear modules
+  trainable groups: {'matmul': (168, 357826560), 'gamma_bias': (121, 71552), 'luts': (0, 0)}
+  optimizer: torch.AdamW (fp32 state)
+  loaded 100 prompts from experiments/fp-emulation/data/prompts_qwen25.pt
+  train: 80  eval: 20
+[09:37:38] step 0 eval
+  pre-train: student_vs_teacher top1=0.9332  kl_p99=1.0241e-01  margin_p99=3.1970e-01
+  step     1  loss=2.5169e-02  kl=1.6089e-02  mse=3.8132e-07  mm=9.0791e-01  scale=0.100
+  step    20  loss=2.4070e-02  kl=1.5647e-02  mse=4.1934e-07  mm=8.4221e-01  scale=1.000
+  step    40  loss=9.5327e-02  kl=1.7723e-02  mse=3.6343e-07  mm=7.7603e+00  scale=0.996
+  step    60  loss=4.5919e-02  kl=1.7955e-02  mse=5.2303e-07  mm=2.7964e+00  scale=0.985
+  step    80  loss=6.8538e-02  kl=2.3925e-02  mse=4.2545e-07  mm=4.4612e+00  scale=0.966
+  step   100  loss=2.5404e-02  kl=1.2082e-02  mse=3.4212e-07  mm=1.3321e+00  scale=0.940
+  [eval @ 100] student_vs_teacher: top1=0.9321  kl_p99=1.1561e-01  margin_p99=3.8906e-01
+  step   120  loss=6.5865e-02  kl=1.2326e-02  mse=3.1565e-07  mm=5.3538e+00  scale=0.907
+  step   140  loss=8.2935e-02  kl=1.2108e-02  mse=2.7864e-07  mm=7.0826e+00  scale=0.868
+  step   160  loss=4.4845e-02  kl=1.5040e-02  mse=3.4864e-07  mm=2.9804e+00  scale=0.824
+  step   180  loss=1.6499e-02  kl=1.1956e-02  mse=2.7471e-07  mm=4.5432e-01  scale=0.775
+  step   200  loss=4.1781e-02  kl=2.0066e-02  mse=4.4809e-07  mm=2.1715e+00  scale=0.722
+  [eval @ 200] student_vs_teacher: top1=0.9340  kl_p99=1.0629e-01  margin_p99=3.7201e-01
+  step   220  loss=6.4049e-02  kl=1.2145e-02  mse=3.2954e-07  mm=5.1904e+00  scale=0.666
+  step   240  loss=8.5026e-02  kl=1.7034e-02  mse=3.3818e-07  mm=6.7991e+00  scale=0.609
+  step   260  loss=3.6291e-02  kl=2.6997e-02  mse=4.6069e-07  mm=9.2930e-01  scale=0.550
+  step   280  loss=5.3944e-02  kl=1.2342e-02  mse=3.0619e-07  mm=4.1602e+00  scale=0.491
+  step   300  loss=2.0259e-02  kl=1.3072e-02  mse=3.0280e-07  mm=7.1876e-01  scale=0.434
+  [eval @ 300] student_vs_teacher: top1=0.9294  kl_p99=1.1605e-01  margin_p99=3.2921e-01
+  step   320  loss=2.9716e-02  kl=1.4261e-02  mse=3.7747e-07  mm=1.5454e+00  scale=0.378
+  step   340  loss=1.8134e-02  kl=1.1393e-02  mse=3.0106e-07  mm=6.7410e-01  scale=0.325
+  step   360  loss=3.5340e-02  kl=1.2934e-02  mse=2.7585e-07  mm=2.2407e+00  scale=0.276
+  step   380  loss=1.8767e-02  kl=1.2066e-02  mse=3.1454e-07  mm=6.7008e-01  scale=0.232
+  step   400  loss=2.7775e-02  kl=1.2209e-02  mse=2.8037e-07  mm=1.5565e+00  scale=0.193
+  [eval @ 400] student_vs_teacher: top1=0.9289  kl_p99=1.0572e-01  margin_p99=3.7201e-01
+  step   420  loss=2.1277e-02  kl=1.3340e-02  mse=3.5359e-07  mm=7.9369e-01  scale=0.160
+  step   440  loss=2.7350e-02  kl=1.5998e-02  mse=3.4202e-07  mm=1.1351e+00  scale=0.134
+  step   460  loss=2.1576e-02  kl=1.2928e-02  mse=2.9965e-07  mm=8.6476e-01  scale=0.115
+  step   480  loss=1.9034e-02  kl=1.3097e-02  mse=2.8757e-07  mm=5.9366e-01  scale=0.104
+  step   500  loss=1.5182e-02  kl=1.0057e-02  mse=2.5130e-07  mm=5.1256e-01  scale=0.100
+  [eval @ 500] student_vs_teacher: top1=0.9326  kl_p99=9.4439e-02  margin_p99=3.3015e-01
+[09:40:51] final eval with best.pt
+done in 198s; pre: top1=0.9332  best: top1=0.9340  post (with best ckpt): top1=0.9340

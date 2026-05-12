@@ -1,0 +1,19 @@
+[13:40:16] loading meta-llama/Llama-3.1-8B-Instruct (torch.bfloat16) on cuda
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7832.37it/s]
+Compressing model: 0it [00:00, ?it/s]Compressing model: 197it [00:00, 1953.70it/s]Compressing model: 224it [00:00, 1858.33it/s]
+Loading weights:   0%|          | 0/515 [00:00<?, ?it/s]Loading weights: 100%|██████████| 515/515 [00:00<00:00, 7126.11it/s]
+  teacher: loaded published checkpoint RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic
+  init_from_teacher: copied 225 weight tensors (block-fp8=0, per-row-fp8=224, plain=1)
+  student: replaced 224 Linears with IntLinear (trainable=True, include_lm_head=False)
+  student: int non-matmul counts: {'rmsnorm': 65, 'silu': 32, 'attention': 32}
+  promoted 0 biases to nn.Parameter
+  per-matmul hooks: paired 224 student↔teacher Linear modules
+  trainable groups: {'matmul': (224, 6979321856), 'gamma_bias': (65, 266240), 'luts': (0, 0)}
+  optimizer: torch.AdamW (fp32 state)
+  loaded 100 prompts from experiments/fp-emulation/data/prompts_llama31.pt
+  train: 80  eval: 20
+[13:40:23] step 0 eval
+  pre-train: student_vs_teacher top1=0.9655  kl_p99=3.6715e-02  margin_p99=1.6985e-01
+[13:40:36] final eval with best.pt
+  steps=0 or best.pt absent → skipping reload; reusing student in-memory state
+done in 25s; pre: top1=0.9655  best: top1=0.9655  post (with best ckpt): top1=0.9655

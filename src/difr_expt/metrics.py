@@ -29,6 +29,23 @@ def logit_l2(ref_logits: torch.Tensor, cand_logits: torch.Tensor) -> torch.Tenso
     return (ref_logits.float() - cand_logits.float()).norm(dim=-1)
 
 
+def logit_l1(ref_logits: torch.Tensor, cand_logits: torch.Tensor) -> torch.Tensor:
+    """Per-position ||l_ref - l_cand||_1 = Σ_j |z_ref,j - z_cand,j|."""
+    return (ref_logits.float() - cand_logits.float()).abs().sum(dim=-1)
+
+
+def logit_max_abs_err(ref_logits: torch.Tensor, cand_logits: torch.Tensor) -> torch.Tensor:
+    """Per-position max_j |z_ref,j - z_cand,j|."""
+    return (ref_logits.float() - cand_logits.float()).abs().amax(dim=-1)
+
+
+def logit_cosine(ref_logits: torch.Tensor, cand_logits: torch.Tensor) -> torch.Tensor:
+    """Per-position cosine similarity of the two logit vectors."""
+    return torch.nn.functional.cosine_similarity(
+        ref_logits.float(), cand_logits.float(), dim=-1
+    )
+
+
 def kl_div_ref_to_cand(
     ref_logits: torch.Tensor, cand_logits: torch.Tensor, temperature: float = 1.0
 ) -> torch.Tensor:

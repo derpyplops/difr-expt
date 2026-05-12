@@ -58,7 +58,10 @@ from difr_expt.patch_hf_model import (
 )
 from difr_expt.metrics import (
     kl_div_ref_to_cand,
+    logit_cosine,
+    logit_l1,
     logit_l2,
+    logit_max_abs_err,
     post_gumbel_margin,
     top1_match,
     topk_overlap,
@@ -112,6 +115,12 @@ class Config:
     int_embedding: bool = False
     embedding_bits: int = 24
     int_lm_head: bool = False  # Match teacher convention (lm_head fp32)
+    init_from_teacher: bool = False  # Cast teacher's quantized weights → student init
+    matmul_loss_weight: float = 0.0  # Σ per-matmul L2; 0 disables
+    matmul_loss_norm: str = "l2"  # l1 | l2 — norm for per-matmul training loss
+    logit_loss_weight: float = 1.0  # final-logit (KL + aux MSE); 0 disables
+    trainable_gamma_bias: bool = True
+    trainable_scales: bool = False  # Promote per-row matmul scales to params
 
 
 def set_seed(seed: int) -> None:
@@ -204,6 +213,171 @@ def pad_collate(batch_ids: list[torch.Tensor], pad_id: int) -> tuple[torch.Tenso
     return ids, mask
 
 
+class MatmulCapture:
+    """Captures outputs of paired Linear modules via forward hooks. Used for
+    per-matmul training loss and per-matmul L1/L2 eval metrics.
+    """
+    def __init__(self, detach: bool = False) -> None:
+        self.detach = detach
+        self.outputs: dict[str, torch.Tensor] = {}
+
+    def hook_for(self, name: str):
+        def _hook(_module: nn.Module, _inputs: Any, output: Any) -> None:
+            o = output if isinstance(output, torch.Tensor) else output[0]
+            # detach+clone breaks inference_mode (so teacher captures from
+            # @torch.inference_mode() are usable as plain tensors) and the
+            # autograd graph (so teacher outputs aren't a backward target).
+            self.outputs[name] = o.detach().clone() if self.detach else o
+        return _hook
+
+    def clear(self) -> None:
+        self.outputs.clear()
+
+
+def register_matmul_hooks(
+    student: nn.Module,
+    teacher: nn.Module,
+) -> tuple[MatmulCapture, MatmulCapture, list[str], list[Any]]:
+    """Hook every IntLinear in `student` and the same-named nn.Linear (incl.
+    CompressedLinear subclass) in `teacher`. Returns
+    (student_capture, teacher_capture, paired_names, handles).
+    """
+    s_cap = MatmulCapture(detach=False)
+    t_cap = MatmulCapture(detach=True)
+    handles: list[Any] = []
+
+    student_names: set[str] = set()
+    for name, m in student.named_modules():
+        if isinstance(m, IntLinear):
+            handles.append(m.register_forward_hook(s_cap.hook_for(name)))
+            student_names.add(name)
+
+    teacher_modules = dict(teacher.named_modules())
+    paired: list[str] = []
+    for name in sorted(student_names):
+        tm = teacher_modules.get(name)
+        if isinstance(tm, nn.Linear):
+            handles.append(tm.register_forward_hook(t_cap.hook_for(name)))
+            paired.append(name)
+    return s_cap, t_cap, paired, handles
+
+
+def per_matmul_loss(
+    s_cap: MatmulCapture,
+    t_cap: MatmulCapture,
+    paired: list[str],
+    norm: str = "l2",
+) -> torch.Tensor:
+    """Σ over paired layers of layer-mean (L1 or L2) divergence."""
+    total: torch.Tensor | None = None
+    for name in paired:
+        s_out = s_cap.outputs.get(name)
+        t_out = t_cap.outputs.get(name)
+        if s_out is None or t_out is None or s_out.shape != t_out.shape:
+            continue
+        diff = s_out.float() - t_out.float()
+        layer = diff.pow(2).mean() if norm == "l2" else diff.abs().mean()
+        total = layer if total is None else (total + layer)
+    if total is None:
+        # No paired layers populated — should never happen if hooks attached
+        # and the forward ran. Return a 0 scalar on the student's device.
+        any_s = next(iter(s_cap.outputs.values()), None)
+        dev = any_s.device if any_s is not None else "cpu"
+        return torch.zeros((), device=dev)
+    return total
+
+
+def per_matmul_metrics(
+    s_cap: MatmulCapture,
+    t_cap: MatmulCapture,
+    paired: list[str],
+) -> dict[str, float]:
+    """Per-layer RMS (sqrt of mean square) and L1 (mean abs) divergence + aggregates."""
+    out: dict[str, float] = {}
+    l2s, l1s = [], []
+    for name in paired:
+        s_out = s_cap.outputs.get(name)
+        t_out = t_cap.outputs.get(name)
+        if s_out is None or t_out is None or s_out.shape != t_out.shape:
+            continue
+        diff = s_out.float() - t_out.float()
+        rms = diff.pow(2).mean().sqrt().item()
+        mae = diff.abs().mean().item()
+        out[f"matmul/{name}/rms"] = rms
+        out[f"matmul/{name}/mae"] = mae
+        l2s.append(rms); l1s.append(mae)
+    if l2s:
+        out["matmul/aggregate/mean_rms"] = sum(l2s) / len(l2s)
+        out["matmul/aggregate/max_rms"] = max(l2s)
+        out["matmul/aggregate/sum_rms"] = sum(l2s)
+        out["matmul/aggregate/mean_mae"] = sum(l1s) / len(l1s)
+        out["matmul/aggregate/max_mae"] = max(l1s)
+        out["matmul/aggregate/sum_mae"] = sum(l1s)
+    return out
+
+
+@torch.inference_mode()
+def per_matmul_eval(
+    teacher: nn.Module,
+    student: nn.Module,
+    eval_prompts: list[torch.Tensor],
+    device: str,
+    s_cap: MatmulCapture,
+    t_cap: MatmulCapture,
+    paired: list[str],
+    n_batches: int = 4,
+) -> dict[str, float]:
+    """Forward one or more eval prompts with hooks active, accumulate per-layer
+    divergences. Run after `evaluate()` so the regular logit metrics aren't
+    affected by these extra captures.
+    """
+    # Per-layer position-averaged L1 (Σ_j |diff|) and L2 (sqrt Σ_j diff²) of the
+    # difference vector along the last dim. Averaged over positions and batches.
+    accum_l2: dict[str, list[float]] = {}
+    accum_l1: dict[str, list[float]] = {}
+    accum_max: dict[str, list[float]] = {}
+    for ids in eval_prompts[:n_batches]:
+        s_cap.clear(); t_cap.clear()
+        input_ids = ids.to(device).unsqueeze(0)
+        teacher(input_ids)
+        student(input_ids)
+        for name in paired:
+            s_out = s_cap.outputs.get(name)
+            t_out = t_cap.outputs.get(name)
+            if s_out is None or t_out is None or s_out.shape != t_out.shape:
+                continue
+            diff = s_out.float() - t_out.float()  # [..., out_features]
+            # Per-position L2 norm averaged over positions.
+            accum_l2.setdefault(name, []).append(diff.norm(dim=-1).mean().item())
+            # Per-position L1 norm averaged over positions.
+            accum_l1.setdefault(name, []).append(diff.abs().sum(dim=-1).mean().item())
+            # Per-position max abs element error averaged over positions.
+            accum_max.setdefault(name, []).append(diff.abs().amax(dim=-1).mean().item())
+    s_cap.clear(); t_cap.clear()
+    out: dict[str, float] = {}
+    l2s, l1s, maxes = [], [], []
+    for name in paired:
+        if name not in accum_l2:
+            continue
+        l2 = sum(accum_l2[name]) / len(accum_l2[name])
+        l1 = sum(accum_l1[name]) / len(accum_l1[name])
+        mx = sum(accum_max[name]) / len(accum_max[name])
+        out[f"matmul/{name}/l2"] = l2
+        out[f"matmul/{name}/l1"] = l1
+        out[f"matmul/{name}/max"] = mx
+        l2s.append(l2); l1s.append(l1); maxes.append(mx)
+    if l2s:
+        out["matmul/aggregate/mean_l2"] = sum(l2s) / len(l2s)
+        out["matmul/aggregate/max_l2"] = max(l2s)
+        out["matmul/aggregate/sum_l2"] = sum(l2s)
+        out["matmul/aggregate/mean_l1"] = sum(l1s) / len(l1s)
+        out["matmul/aggregate/max_l1"] = max(l1s)
+        out["matmul/aggregate/sum_l1"] = sum(l1s)
+        out["matmul/aggregate/mean_max"] = sum(maxes) / len(maxes)
+        out["matmul/aggregate/max_max"] = max(maxes)
+    return out
+
+
 @torch.inference_mode()
 def evaluate(
     teacher: nn.Module,
@@ -227,8 +401,11 @@ def evaluate(
 
     out: dict[str, float] = {}
     for tag, ref, cand in pair_keys:
-        all_top1, all_top5, all_l2, all_kl, all_margin = [], [], [], [], []
+        all_top1, all_top5, all_top10 = [], [], []
+        all_l1, all_l2, all_maxerr, all_cos = [], [], [], []
+        all_kl, all_margin = [], []
         n_positions = 0
+        v_last = 0
         rng = torch.Generator(device=device).manual_seed(seed)
         for ids in eval_prompts:
             if n_positions >= max_positions:
@@ -237,28 +414,42 @@ def evaluate(
             r_logits = ref(input_ids).logits[0]
             c_logits = cand(input_ids).logits[0]
             v = min(r_logits.shape[-1], c_logits.shape[-1])
+            v_last = v
             r_logits = r_logits[..., :v]
             c_logits = c_logits[..., :v]
-            t1 = top1_match(r_logits, c_logits)
-            t5 = topk_overlap(r_logits, c_logits, k=5)
-            l2 = logit_l2(r_logits, c_logits)
-            kl = kl_div_ref_to_cand(r_logits, c_logits, temperature=temperature)
+            all_top1.append(top1_match(r_logits, c_logits))
+            all_top5.append(topk_overlap(r_logits, c_logits, k=5))
+            all_top10.append(topk_overlap(r_logits, c_logits, k=10))
+            all_l1.append(logit_l1(r_logits, c_logits))
+            all_l2.append(logit_l2(r_logits, c_logits))
+            all_maxerr.append(logit_max_abs_err(r_logits, c_logits))
+            all_cos.append(logit_cosine(r_logits, c_logits))
+            all_kl.append(kl_div_ref_to_cand(r_logits, c_logits, temperature=temperature))
             u = torch.empty_like(r_logits, dtype=torch.float32)
             u.uniform_(1e-10, 1.0, generator=rng)
             gumbel = -torch.log(-torch.log(u))
-            mg = post_gumbel_margin(r_logits, c_logits, gumbel, temperature=temperature)
-            all_top1.append(t1); all_top5.append(t5); all_l2.append(l2); all_kl.append(kl); all_margin.append(mg)
+            all_margin.append(post_gumbel_margin(r_logits, c_logits, gumbel, temperature=temperature))
             n_positions += r_logits.shape[0]
         cat = lambda xs: torch.cat(xs)
         out[f"{tag}/top1"] = cat(all_top1).float().mean().item()
         out[f"{tag}/top5"] = cat(all_top5).mean().item()
-        out[f"{tag}/logit_l2_mean"] = cat(all_l2).mean().item()
-        out[f"{tag}/logit_l2_p99"] = cat(all_l2).quantile(0.99).item()
+        out[f"{tag}/top10"] = cat(all_top10).mean().item()
+        l1 = cat(all_l1); l2 = cat(all_l2); maxerr = cat(all_maxerr); cos = cat(all_cos)
+        out[f"{tag}/logit_l1_mean"] = l1.mean().item()
+        out[f"{tag}/logit_l1_p99"] = l1.quantile(0.99).item()
+        out[f"{tag}/logit_mae_mean"] = (l1 / max(v_last, 1)).mean().item()
+        out[f"{tag}/logit_l2_mean"] = l2.mean().item()
+        out[f"{tag}/logit_l2_p99"] = l2.quantile(0.99).item()
+        out[f"{tag}/logit_max_err_mean"] = maxerr.mean().item()
+        out[f"{tag}/logit_max_err_p99"] = maxerr.quantile(0.99).item()
+        out[f"{tag}/logit_cosine_mean"] = cos.mean().item()
+        out[f"{tag}/logit_cosine_p01"] = cos.quantile(0.01).item()
         out[f"{tag}/kl_mean"] = cat(all_kl).mean().item()
         out[f"{tag}/kl_p99"] = cat(all_kl).quantile(0.99).item()
         out[f"{tag}/margin_mean"] = cat(all_margin).mean().item()
         out[f"{tag}/margin_p99"] = cat(all_margin).quantile(0.99).item()
         out[f"{tag}/n_positions"] = n_positions
+        out[f"{tag}/vocab_size"] = v_last
     return out
 
 
@@ -307,8 +498,11 @@ def build_models(
     int_embedding: bool,
     embedding_bits: int,
     int_lm_head: bool = False,
+    init_from_teacher: bool = False,
     keep_fp32_ref: bool = True,
     grad_checkpointing: bool = False,
+    patch_nonmatmul: bool = True,
+    int_nonmatmul_bitexact: bool = False,
 ) -> tuple[nn.Module, nn.Module, nn.Module | None]:
     """Build (teacher, student, ref).
 
@@ -349,6 +543,63 @@ def build_models(
     for p in teacher.parameters():
         p.requires_grad = False
 
+    if init_from_teacher and teacher_source == "published":
+        # Cast teacher's quantized weights into base before deepcopy — this way
+        # the int24 student starts from the teacher's effective weights instead
+        # of the unquantized fp32 base. Removes weight-side noise from the
+        # student-vs-teacher gap (int24 has 10,000x more resolution than fp8 so
+        # the cast itself is essentially lossless). Only activation-precision
+        # noise remains as a training target.
+        #
+        # Handles three teacher formats:
+        # - CompressedLinear (RedHatAI per-row): weight (e4m3) * weight_scale.
+        # - FP8Linear (DeepSeek / Qwen3 block fp8): weight (e4m3) * blockwise
+        #   expanded weight_scale_inv (typically 128x128 blocks).
+        # - Plain nn.Linear (lm_head, etc.) at native precision.
+        # Critical: must check fp8 dtype BEFORE falling through to plain-Linear
+        # branch since FP8Linear IS an nn.Linear subclass.
+        try:
+            from compressed_tensors.linear.compressed_linear import CompressedLinear
+        except ImportError:
+            CompressedLinear = type(None)
+        n_block = 0
+        n_perrow = 0
+        n_plain = 0
+        teacher_modules = dict(teacher.named_modules())
+        for name, bm in base.named_modules():
+            if not isinstance(bm, nn.Linear):
+                continue
+            tm = teacher_modules.get(name)
+            if tm is None:
+                continue
+            if (hasattr(tm, "weight_scale_inv")
+                    and getattr(tm.weight, "dtype", None) == torch.float8_e4m3fn):
+                # Block fp8 dequant
+                W = tm.weight.to(torch.float32)
+                S = tm.weight_scale_inv.to(torch.float32)
+                bh = W.shape[0] // S.shape[0]
+                bw = W.shape[1] // S.shape[1]
+                Sexp = S.repeat_interleave(bh, dim=0).repeat_interleave(bw, dim=1)
+                w_fp = W * Sexp
+                n_block += 1
+            elif isinstance(tm, CompressedLinear):
+                # Per-row fp8 dequant
+                w_fp = tm.weight.float() * tm.weight_scale.float()
+                n_perrow += 1
+            elif (isinstance(tm, nn.Linear)
+                    and getattr(tm.weight, "dtype", None) != torch.float8_e4m3fn):
+                # Plain high-precision linear (e.g. lm_head)
+                w_fp = tm.weight.detach().float()
+                n_plain += 1
+            else:
+                continue
+            if w_fp.shape != bm.weight.shape:
+                print(f"  init_from_teacher: shape mismatch at {name} — skip")
+                continue
+            bm.weight.data.copy_(w_fp.to(bm.weight.dtype))
+        print(f"  init_from_teacher: copied {n_block + n_perrow + n_plain} weight tensors "
+              f"(block-fp8={n_block}, per-row-fp8={n_perrow}, plain={n_plain})")
+
     student = copy.deepcopy(base)
     # Match teacher convention: published fp8/fp4 checkpoints leave lm_head in
     # bf16/fp32. Mirroring that here keeps the comparison apples-to-apples and
@@ -363,6 +614,32 @@ def build_models(
     )
     print(f"  student: replaced {len(replaced)} Linears with IntLinear "
           f"(trainable={trainable_matmul_weights}, include_lm_head={int_lm_head})")
+    # If teacher has block-fp8 weights, stash the original fp8 weight + scale_inv
+    # onto each IntLinear so the block_fp8_kernel_path forward can reproduce the
+    # Triton kernel bit-exactly (needed for top1=1.0 on Qwen3-8B-FP8 etc.).
+    if init_from_teacher and teacher_source == "published":
+        teacher_modules = dict(teacher.named_modules())
+        n_stash = 0
+        for name, m in student.named_modules():
+            tm = teacher_modules.get(name)
+            if tm is None:
+                continue
+            if (hasattr(tm, "weight_scale_inv")
+                    and getattr(tm.weight, "dtype", None) == torch.float8_e4m3fn
+                    and isinstance(m, IntLinear)):
+                # Register as actual buffers so .to(device) / state_dict work
+                m.register_buffer(
+                    "block_fp8_weight", tm.weight.detach().clone(),
+                    persistent=False,
+                )
+                m.register_buffer(
+                    "block_fp8_scale_inv", tm.weight_scale_inv.detach().clone(),
+                    persistent=False,
+                )
+                n_stash += 1
+        if n_stash:
+            print(f"  stashed block-fp8 weight+scale_inv on {n_stash} IntLinears "
+                  f"(for --block-fp8-kernel-path)")
     ops_cfg = IntOpsConfig(
         rmsnorm_bits=rmsnorm_bits,
         softmax_lut_size=softmax_lut_size,
@@ -370,8 +647,16 @@ def build_models(
         silu_lut_size=silu_lut_size,
         attn_matmul_bits=attn_matmul_bits,
     )
-    counts = patch_model_int_nonmatmul(student, ops_cfg)
-    print(f"  student: int non-matmul counts: {counts}")
+    if int_nonmatmul_bitexact:
+        from difr_expt.int_ops_bitexact import patch_model_int_bitexact
+        counts = patch_model_int_bitexact(student)
+        print(f"  student: BITEXACT int commit wrappers: {counts} "
+              "(int30 round-trip + teacher kernels; output bit-exact teacher)")
+    elif patch_nonmatmul:
+        counts = patch_model_int_nonmatmul(student, ops_cfg)
+        print(f"  student: int non-matmul counts: {counts}")
+    else:
+        print(f"  student: int non-matmul DISABLED (using teacher-equivalent softmax/SiLU/RMSNorm/attn)")
     if int_embedding:
         emb = patch_model_int_embedding(student, bits=embedding_bits)
         print(f"  student: replaced {len(emb)} embeddings with IntEmbedding")
@@ -447,8 +732,72 @@ def main():
                     help="Apply IntLinear to lm_head too. Default off — matches "
                          "published-teacher convention (fp32 lm_head) and avoids ~10GB "
                          "of forward transients on 8B.")
+    ap.add_argument("--init-from-teacher", action="store_true",
+                    help="Cast teacher's quantized weights → student weight_fp init "
+                         "(instead of fp32 base weights). Resolves weight-side noise "
+                         "for free; only activation-precision gap remains for training.")
+    ap.add_argument("--matmul-loss-weight", type=float, default=0.0,
+                    help="Weight on Σ per-matmul L2 loss between paired teacher/student "
+                         "Linear outputs. 0 disables; default 0 keeps logit-only loss.")
+    ap.add_argument("--logit-loss-weight", type=float, default=1.0,
+                    help="Weight on final-logit (KL + aux MSE) loss. Set 0 for per-matmul-only.")
+    ap.add_argument("--matmul-loss-norm", choices=["l1", "l2"], default="l2")
+    ap.add_argument("--no-trainable-gamma-bias", action="store_true",
+                    help="Keep RMSNorm gamma and Linear biases frozen.")
+    ap.add_argument("--trainable-scales", action="store_true",
+                    help="Promote per-row matmul scales to nn.Parameters (otherwise "
+                         "derived from absmax each forward).")
     ap.add_argument("--no-fp32-ref", action="store_true",
                     help="Don't keep an fp32 ref in memory (saves RAM on CPU runs).")
+    ap.add_argument("--no-int-nonmatmul", action="store_true",
+                    help="Skip patching softmax/SiLU/RMSNorm/attention to int variants. "
+                         "Diagnostic: isolates the contribution of non-matmul int ops "
+                         "to the student-teacher gap.")
+    ap.add_argument("--int-nonmatmul-bitexact", action="store_true",
+                    help="Wrap teacher's non-matmul ops (RMSNorm, SiLU, etc.) with "
+                         "explicit int30 commit wrappers. The bf16↔int30 round-trip "
+                         "is exact identity, so kernels run on the same inputs as "
+                         "teacher → output bit-exact. This makes the int architecture "
+                         "visible at every layer boundary (prover commits int30 + scale "
+                         "per token). Combine with --int-matmul-path and --activation-fp8 "
+                         "for the full-int model: every value committed as int at every "
+                         "boundary; deterministic kernels in between; top1=1.0 vs teacher.")
+    ap.add_argument("--activation-fp8", action="store_true",
+                    help="Use fp8 e4m3 levels (NOT uniform int24 grid) for per-token "
+                         "activation quant. Mimics the teacher's fp8-dynamic activation "
+                         "rounding pattern exactly. The 256 fp8 levels are exactly "
+                         "representable in int24 storage; in a ZK circuit, this is a "
+                         "256-entry LUT, no float ops needed.")
+    ap.add_argument("--activation-block-fp8", action="store_true",
+                    help="Use fp8 e4m3 levels with BLOCK granularity along the last dim "
+                         "(per --activation-block-size, default 128). Mimics Qwen3-style "
+                         "block-fp8 teacher activation quantization.")
+    ap.add_argument("--activation-block-size", type=int, default=128,
+                    help="Block size (along last dim) for --activation-block-fp8.")
+    ap.add_argument("--int-matmul-path", action="store_true",
+                    help="Compute matmuls via explicit int24 × int24 + public-scale "
+                         "dequant (executed as fp64, bit-equivalent for int48 products). "
+                         "Demonstrates all-integer arithmetic — what a ZK circuit would "
+                         "do. Currently only supports --activation-fp8 (per-token) scheme.")
+    ap.add_argument("--block-fp8-kernel-path", action="store_true",
+                    help="For block-fp8 teachers (e.g. Qwen3-8B-FP8): call the same "
+                         "Triton w8a8_block_fp8_matmul kernel as the teacher, on the "
+                         "stashed original fp8 weight + per-128-block scale_inv. This is "
+                         "bit-exact teacher by construction. The ZK-spec equivalent is "
+                         "the per-K-block fp32 emulation (sum int30 partial products "
+                         "with per-tile scales; verified 99.99% per-layer bit-exact in "
+                         "standalone test).")
+    ap.add_argument("--skip-pretrain-checkpoint", action="store_true",
+                    help="Don't write pretrain.pt (initial-state snapshot). Saves "
+                         "~30 GB disk on 8B runs where the init is reproducible from "
+                         "--init-from-teacher.")
+    ap.add_argument("--skip-final-checkpoint", action="store_true",
+                    help="Don't write final.pt (last-step snapshot, usually redundant "
+                         "with best.pt). Saves ~30 GB disk on 8B runs.")
+    ap.add_argument("--no-matmul-hooks", action="store_true",
+                    help="Skip registering per-matmul forward hooks. Saves a few GB "
+                         "of activation memory on 8B and disables per-matmul metrics "
+                         "(which aren't used by V2-style logit-only training).")
     args = ap.parse_args()
 
     import sys as _sys
@@ -493,6 +842,12 @@ def main():
         int_embedding=args.int_embedding,
         embedding_bits=args.embedding_bits,
         int_lm_head=args.int_lm_head,
+        init_from_teacher=args.init_from_teacher,
+        matmul_loss_weight=args.matmul_loss_weight,
+        matmul_loss_norm=args.matmul_loss_norm,
+        logit_loss_weight=args.logit_loss_weight,
+        trainable_gamma_bias=not args.no_trainable_gamma_bias,
+        trainable_scales=args.trainable_scales,
     )
     out_dir = Path(cfg.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -531,8 +886,11 @@ def main():
         int_embedding=cfg.int_embedding,
         embedding_bits=cfg.embedding_bits,
         int_lm_head=cfg.int_lm_head,
+        init_from_teacher=cfg.init_from_teacher,
         keep_fp32_ref=not args.no_fp32_ref,
         grad_checkpointing=cfg.grad_checkpointing,
+        patch_nonmatmul=not args.no_int_nonmatmul and not args.int_nonmatmul_bitexact,
+        int_nonmatmul_bitexact=args.int_nonmatmul_bitexact,
     )
 
     n_biases = promote_intlinear_biases(student)
@@ -540,6 +898,52 @@ def main():
     if cfg.trainable_luts:
         n_sm, n_silu = promote_luts(student)
         print(f"  promoted {n_sm} softmax LUTs + {n_silu} silu LUTs to nn.Parameter")
+
+    # On 8B, every layer's forward output captured by a non-detached hook adds
+    # direct references that prevent intermediate frees during training. When
+    # the run doesn't actually need per-matmul loss/metrics (V2-style logit-only
+    # training), skip hooks entirely. Falls back to empty captures so eval code
+    # paths still work — they just emit no matmul/* metrics.
+    if args.no_matmul_hooks:
+        print("  per-matmul hooks SKIPPED (--no-matmul-hooks); per-matmul metrics will be empty")
+        s_cap = MatmulCapture(detach=False)
+        t_cap = MatmulCapture(detach=True)
+        paired_layers = []
+        _hook_handles = []
+    else:
+        s_cap, t_cap, paired_layers, _hook_handles = register_matmul_hooks(student, teacher)
+        print(f"  per-matmul hooks: paired {len(paired_layers)} student↔teacher Linear modules")
+
+    if args.activation_fp8:
+        n = 0
+        for m in student.modules():
+            if isinstance(m, IntLinear):
+                m.activation_scheme = "fp8_e4m3"
+                n += 1
+        print(f"  activation scheme set to fp8_e4m3 on {n} IntLinears (mimics teacher's fp8-dynamic activation quant)")
+    if args.activation_block_fp8:
+        n = 0
+        for m in student.modules():
+            if isinstance(m, IntLinear):
+                m.activation_scheme = "block_fp8_e4m3"
+                m.activation_block_size = args.activation_block_size
+                n += 1
+        print(f"  activation scheme set to block_fp8_e4m3 (block_size={args.activation_block_size}) on {n} IntLinears")
+    if args.int_matmul_path:
+        n = 0
+        for m in student.modules():
+            if isinstance(m, IntLinear):
+                m.use_int_matmul_path = True
+                n += 1
+        print(f"  int24×int24 matmul path enabled on {n} IntLinears (executed as fp64; bit-equivalent for int48 products)")
+    if args.block_fp8_kernel_path:
+        n = 0
+        for m in student.modules():
+            if isinstance(m, IntLinear) and m.block_fp8_weight is not None:
+                m.use_block_fp8_kernel_path = True
+                n += 1
+        print(f"  block-fp8 kernel path enabled on {n} IntLinears "
+              f"(calls Triton w8a8_block_fp8_matmul; bit-exact teacher)")
 
     groups = collect_trainable(
         student,
@@ -568,8 +972,16 @@ def main():
             raise SystemExit(
                 "--use-8bit-adamw requires bitsandbytes (pip install bitsandbytes)"
             ) from e
-        optimizer = bnb.optim.AdamW8bit(param_groups, weight_decay=0.0)
-        print("  optimizer: bnb.AdamW8bit")
+        # PagedAdamW8bit pages optimizer state in/out from CPU via the unified
+        # CUDA memory subsystem. This avoids the ~14 GB GPU residency of
+        # AdamW8bit's state buffers — important when the model + grads already
+        # occupy ~78 GB on the 80 GB H100, leaving no headroom for state init.
+        try:
+            optimizer = bnb.optim.PagedAdamW8bit(param_groups, weight_decay=0.0)
+            print("  optimizer: bnb.PagedAdamW8bit (CPU-paged state)")
+        except AttributeError:
+            optimizer = bnb.optim.AdamW8bit(param_groups, weight_decay=0.0)
+            print("  optimizer: bnb.AdamW8bit (GPU state)")
     else:
         optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
         print("  optimizer: torch.AdamW (fp32 state)")
@@ -600,6 +1012,7 @@ def main():
         temperature=cfg.temperature, seed=cfg.seed,
         ref_model=ref,
     )
+    pre.update(per_matmul_eval(teacher, student, eval_prompts, device, s_cap, t_cap, paired_layers))
     pre["step"] = 0; pre["lr"] = 0.0; pre["loss"] = float("nan")
     log(pre)
     print(f"  pre-train: student_vs_teacher top1={pre['student_vs_teacher/top1']:.4f}  "
@@ -609,19 +1022,30 @@ def main():
         print(f"  pre-train: student_vs_ref top1={pre['student_vs_ref/top1']:.4f}  "
               f"teacher_vs_ref top1={pre['teacher_vs_ref/top1']:.4f}")
 
-    save_trained_deltas(student, out_dir / "pretrain.pt")
+    if not args.skip_pretrain_checkpoint and cfg.steps > 0:
+        save_trained_deltas(student, out_dir / "pretrain.pt")
 
     student.train()
     best_top1 = pre["student_vs_teacher/top1"]
     plateau = 0
     best_step = 0
-    save_trained_deltas(student, out_dir / "best.pt")
+    # Save an initial best.pt snapshot of the cast-from-teacher state. On 8B
+    # this is ~28 GB — skip when --skip-pretrain-checkpoint also implies
+    # we don't need it (only training-time best.pt overwrites matter then).
+    if cfg.steps > 0 and not args.skip_pretrain_checkpoint:
+        save_trained_deltas(student, out_dir / "best.pt")
+
+    # Drop allocator caches before training — pre-eval transients can keep
+    # 5-10 GB reserved that the optimizer init needs.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     for step in range(1, cfg.steps + 1):
         batch_ids = [train_prompts[rng.randrange(len(train_prompts))] for _ in range(cfg.batch)]
         input_ids, mask = pad_collate(batch_ids, pad_id)
         input_ids = input_ids.to(device); mask = mask.to(device)
 
+        s_cap.clear(); t_cap.clear()
         with torch.inference_mode():
             teacher_logits = teacher(input_ids).logits
         student_logits = student(input_ids).logits
@@ -644,7 +1068,12 @@ def main():
         mse_per_pos = diff.pow(2).mean(dim=-1)
         mse_loss = (mse_per_pos * valid).sum() / valid.sum().clamp_min(1.0) / v
 
-        loss = kl_loss + cfg.aux_weight * mse_loss
+        logit_term = kl_loss + cfg.aux_weight * mse_loss
+        if cfg.matmul_loss_weight > 0.0:
+            mm_loss = per_matmul_loss(s_cap, t_cap, paired_layers, norm=cfg.matmul_loss_norm)
+        else:
+            mm_loss = torch.zeros((), device=device)
+        loss = cfg.logit_loss_weight * logit_term + cfg.matmul_loss_weight * mm_loss
 
         # Cosine-warmup LR — scale each param group by its base lr.
         progress = cosine_warmup(step, cfg.warmup, cfg.steps, 1.0)
@@ -667,7 +1096,7 @@ def main():
 
         if step % 20 == 0 or step == 1:
             print(f"  step {step:5d}  loss={loss.item():.4e}  kl={kl_loss.item():.4e}  "
-                  f"mse={mse_loss.item():.4e}  scale={progress:.3f}")
+                  f"mse={mse_loss.item():.4e}  mm={mm_loss.item():.4e}  scale={progress:.3f}")
 
         if step % cfg.eval_every == 0:
             student.eval()
@@ -677,6 +1106,7 @@ def main():
                 temperature=cfg.temperature, seed=cfg.seed,
                 ref_model=ref,
             )
+            ev.update(per_matmul_eval(teacher, student, eval_prompts, device, s_cap, t_cap, paired_layers))
             ev["step"] = step; ev["lr"] = optimizer.param_groups[0]["lr"]; ev["loss"] = loss.item()
             log(ev)
             print(
@@ -697,8 +1127,11 @@ def main():
                 print(f"  plateau ({plateau} no-improvements); stopping at step {step}")
                 break
 
-    save_trained_deltas(student, out_dir / "final.pt")
-    # Final eval with the best checkpoint reloaded.
+    if not args.skip_final_checkpoint and cfg.steps > 0:
+        save_trained_deltas(student, out_dir / "final.pt")
+    # Final eval with the best checkpoint reloaded — but for steps=0 the model
+    # is already in its post-init state and best.pt was never written. Skip the
+    # reload in that case (and re-use the pre eval as post).
     print(f"[{time.strftime('%H:%M:%S')}] final eval with best.pt")
     # On 8B, the optimizer state + student + grads occupy ~75 GB; loading best.pt
     # (30 GB) directly to GPU on top of that OOMs the 80 GB H100. Free optimizer
@@ -708,29 +1141,35 @@ def main():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    payload = torch.load(out_dir / "best.pt", weights_only=False, map_location="cpu")
-    gammas = payload.get("rmsnorm_gamma", {})
-    biases = payload.get("linear_bias", {})
-    weights = payload.get("linear_weight_fp", {})
-    sm_luts = payload.get("softmax_lut", {})
-    silu_luts = payload.get("silu_lut", {})
-    for name, m in student.named_modules():
-        if isinstance(m, IntRMSNorm) and name in gammas:
-            with torch.no_grad():
-                m.weight.data.copy_(gammas[name].to(m.weight.device, m.weight.dtype))
-        elif isinstance(m, IntLinear):
-            if name in biases and m.bias is not None and isinstance(m.bias, nn.Parameter):
+    best_path = out_dir / "best.pt"
+    if cfg.steps > 0 and best_path.exists():
+        payload = torch.load(best_path, weights_only=False, map_location="cpu")
+        gammas = payload.get("rmsnorm_gamma", {})
+        biases = payload.get("linear_bias", {})
+        weights = payload.get("linear_weight_fp", {})
+        sm_luts = payload.get("softmax_lut", {})
+        silu_luts = payload.get("silu_lut", {})
+        for name, m in student.named_modules():
+            if isinstance(m, IntRMSNorm) and name in gammas:
                 with torch.no_grad():
-                    m.bias.data.copy_(biases[name].to(m.bias.device, m.bias.dtype))
-            if name in weights and m.weight_fp is not None:
+                    m.weight.data.copy_(gammas[name].to(m.weight.device, m.weight.dtype))
+            elif isinstance(m, IntLinear):
+                if name in biases and m.bias is not None and isinstance(m.bias, nn.Parameter):
+                    with torch.no_grad():
+                        m.bias.data.copy_(biases[name].to(m.bias.device, m.bias.dtype))
+                if name in weights and m.weight_fp is not None:
+                    with torch.no_grad():
+                        m.weight_fp.data.copy_(weights[name].to(m.weight_fp.device, m.weight_fp.dtype))
+            elif isinstance(m, IntSoftmaxModule) and name in sm_luts:
                 with torch.no_grad():
-                    m.weight_fp.data.copy_(weights[name].to(m.weight_fp.device, m.weight_fp.dtype))
-        elif isinstance(m, IntSoftmaxModule) and name in sm_luts:
-            with torch.no_grad():
-                m.lut.data.copy_(sm_luts[name].to(m.lut.device, m.lut.dtype))
-        elif isinstance(m, IntSiLUModule) and name in silu_luts:
-            with torch.no_grad():
-                m.lut.data.copy_(silu_luts[name].to(m.lut.device, m.lut.dtype))
+                    m.lut.data.copy_(sm_luts[name].to(m.lut.device, m.lut.dtype))
+            elif isinstance(m, IntSiLUModule) and name in silu_luts:
+                with torch.no_grad():
+                    m.lut.data.copy_(silu_luts[name].to(m.lut.device, m.lut.dtype))
+    else:
+        # No training happened (steps=0) → student is already at its post-init
+        # state and the pre eval is equivalent to a post eval. Skip the reload.
+        print("  steps=0 or best.pt absent → skipping reload; reusing student in-memory state")
 
     student.eval()
     post = evaluate(
@@ -739,6 +1178,7 @@ def main():
         temperature=cfg.temperature, seed=cfg.seed,
         ref_model=ref,
     )
+    post.update(per_matmul_eval(teacher, student, eval_prompts, device, s_cap, t_cap, paired_layers))
     post["step"] = -1; post["lr"] = 0.0; post["loss"] = float("nan")
     post["best_step"] = best_step
     log(post)

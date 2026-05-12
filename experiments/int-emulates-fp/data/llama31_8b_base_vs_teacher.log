@@ -1,0 +1,7 @@
+loading base and teacher in torch.bfloat16
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights: 100%|██████████| 291/291 [00:00<00:00, 7756.12it/s]
+Compressing model: 0it [00:00, ?it/s]Compressing model: 197it [00:00, 1946.60it/s]Compressing model: 224it [00:00, 1851.98it/s]
+Loading weights:   0%|          | 0/515 [00:00<?, ?it/s]Loading weights: 100%|██████████| 515/515 [00:00<00:00, 7657.15it/s]
+  copied 225 weight tensors from teacher into base (block-fp8=0, per-row-fp8=224, plain=1)
+  evaluating on 20 held-out prompts
+top1 (base-with-cast vs teacher) = 0.9658  kl_mean=5.4440e-03  kl_p99=3.7497e-02  n_positions=3628

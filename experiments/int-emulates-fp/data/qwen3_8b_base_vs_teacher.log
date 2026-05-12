@@ -1,0 +1,7 @@
+loading base and teacher in torch.bfloat16
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights: 100%|██████████| 399/399 [00:00<00:00, 7583.50it/s]
+You have loaded an FP8 model on CPU and have a CUDA or XPU device available, make sure to set your model on a GPU or XPU device in order to run your model. To remove this warning, pass device_map = 'cuda' or 'xpu'. 
+Loading weights:   0%|          | 0/651 [00:00<?, ?it/s]Loading weights: 100%|██████████| 651/651 [00:00<00:00, 7215.77it/s]
+  copied 253 weight tensors from teacher into base (block-fp8=252, per-row-fp8=0, plain=1)
+  evaluating on 20 held-out prompts
+top1 (base-with-cast vs teacher) = 0.9605  kl_mean=7.2431e-03  kl_p99=7.0438e-02  n_positions=3697

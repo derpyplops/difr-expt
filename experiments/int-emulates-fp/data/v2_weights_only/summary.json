@@ -1,0 +1,34 @@
+{
+  "pre": {
+    "student_vs_teacher/top1": 0.9331890344619751,
+    "student_vs_teacher/top5": 0.9313496947288513,
+    "student_vs_teacher/logit_l2_mean": 82.95606231689453,
+    "student_vs_teacher/logit_l2_p99": 212.08253479003906,
+    "student_vs_teacher/kl_mean": 0.015422635711729527,
+    "student_vs_teacher/kl_p99": 0.10241233557462692,
+    "student_vs_teacher/margin_mean": 0.013787434436380863,
+    "student_vs_teacher/margin_p99": 0.3196958899497986,
+    "student_vs_teacher/n_positions": 3697,
+    "step": 0,
+    "lr": 0.0,
+    "loss": NaN,
+    "wall_s": 4.453380107879639
+  },
+  "post": {
+    "student_vs_teacher/top1": 0.9353529214859009,
+    "student_vs_teacher/top5": 0.931620180606842,
+    "student_vs_teacher/logit_l2_mean": 82.69999694824219,
+    "student_vs_teacher/logit_l2_p99": 199.1178741455078,
+    "student_vs_teacher/kl_mean": 0.01506655104458332,
+    "student_vs_teacher/kl_p99": 0.10727735608816147,
+    "student_vs_teacher/margin_mean": 0.01387298945337534,
+    "student_vs_teacher/margin_p99": 0.35735151171684265,
+    "student_vs_teacher/n_positions": 3697,
+    "step": -1,
+    "lr": 0.0,
+    "loss": NaN,
+    "best_step": 200,
+    "wall_s": 182.0919008255005
+  },
+  "best_step": 200
+}

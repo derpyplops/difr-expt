@@ -1,0 +1,8 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "teacher": "Qwen/Qwen3-8B-FP8",
+  "top1_base_vs_teacher": 0.9605,
+  "kl_mean": 0.0072431,
+  "kl_p99": 0.070438,
+  "n_positions": 3697
+}

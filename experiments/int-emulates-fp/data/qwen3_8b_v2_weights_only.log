@@ -1,0 +1,51 @@
+[13:27:36] loading Qwen/Qwen3-8B (torch.bfloat16) on cuda
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights: 100%|██████████| 399/399 [00:00<00:00, 7811.79it/s]
+You have loaded an FP8 model on CPU and have a CUDA or XPU device available, make sure to set your model on a GPU or XPU device in order to run your model. To remove this warning, pass device_map = 'cuda' or 'xpu'. 
+Loading weights:   0%|          | 0/651 [00:00<?, ?it/s]Loading weights: 100%|██████████| 651/651 [00:00<00:00, 7209.05it/s]
+  teacher: loaded published checkpoint Qwen/Qwen3-8B-FP8
+  init_from_teacher: copied 253 weight tensors (block-fp8=252, per-row-fp8=0, plain=1)
+  student: replaced 252 Linears with IntLinear (trainable=True, include_lm_head=False)
+  student: int non-matmul counts: {'rmsnorm': 145, 'silu': 36, 'attention': 36}
+  student: gradient checkpointing enabled
+  promoted 0 biases to nn.Parameter
+  per-matmul hooks SKIPPED (--no-matmul-hooks); per-matmul metrics will be empty
+  trainable groups: {'matmul': (252, 6945767424), 'gamma_bias': (145, 308224), 'luts': (0, 0)}
+  optimizer: bnb.AdamW8bit
+  loaded 100 prompts from experiments/fp-emulation/data/prompts_qwen3.pt
+  train: 80  eval: 20
+[13:27:43] step 0 eval
+  pre-train: student_vs_teacher top1=0.9624  kl_p99=8.1327e-02  margin_p99=2.7613e-01
+`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.
+  step     1  loss=1.0680e-02  kl=1.0680e-02  mse=2.6604e-07  mm=0.0000e+00  scale=0.040
+  step    20  loss=1.0792e-02  kl=1.0791e-02  mse=8.6008e-07  mm=0.0000e+00  scale=0.420
+  step    40  loss=5.9085e-03  kl=5.9079e-03  mse=6.0569e-07  mm=0.0000e+00  scale=0.820
+  step    60  loss=4.7923e-03  kl=4.7918e-03  mse=4.7262e-07  mm=0.0000e+00  scale=0.999
+  step    80  loss=4.1325e-03  kl=4.1324e-03  mse=1.5773e-07  mm=0.0000e+00  scale=0.990
+  step   100  loss=1.0199e-02  kl=1.0199e-02  mse=3.5657e-07  mm=0.0000e+00  scale=0.973
+  [eval @ 100] student_vs_teacher: top1=0.9619  kl_p99=7.5250e-02  margin_p99=2.7000e-01
+  step   120  loss=6.6591e-03  kl=6.6588e-03  mse=2.7024e-07  mm=0.0000e+00  scale=0.947
+  step   140  loss=4.4233e-03  kl=4.4231e-03  mse=2.0908e-07  mm=0.0000e+00  scale=0.914
+  step   160  loss=8.4270e-03  kl=8.4268e-03  mse=2.6073e-07  mm=0.0000e+00  scale=0.874
+  step   180  loss=8.7659e-03  kl=8.7655e-03  mse=3.5655e-07  mm=0.0000e+00  scale=0.827
+  step   200  loss=1.3408e-02  kl=1.3407e-02  mse=8.3553e-07  mm=0.0000e+00  scale=0.775
+  [eval @ 200] student_vs_teacher: top1=0.9621  kl_p99=7.8409e-02  margin_p99=2.6833e-01
+  step   220  loss=3.5496e-03  kl=3.5493e-03  mse=2.8938e-07  mm=0.0000e+00  scale=0.719
+  step   240  loss=1.1117e-02  kl=1.1117e-02  mse=3.9230e-07  mm=0.0000e+00  scale=0.659
+  step   260  loss=7.1809e-03  kl=7.1806e-03  mse=3.1171e-07  mm=0.0000e+00  scale=0.597
+  step   280  loss=1.1298e-02  kl=1.1297e-02  mse=4.8050e-07  mm=0.0000e+00  scale=0.534
+  step   300  loss=5.8934e-03  kl=5.8930e-03  mse=4.3617e-07  mm=0.0000e+00  scale=0.472
+  [eval @ 300] student_vs_teacher: top1=0.9583  kl_p99=8.2709e-02  margin_p99=2.4283e-01
+  step   320  loss=4.1924e-03  kl=4.1923e-03  mse=8.1136e-08  mm=0.0000e+00  scale=0.411
+  step   340  loss=1.3900e-02  kl=1.3899e-02  mse=6.9469e-07  mm=0.0000e+00  scale=0.353
+  step   360  loss=4.6694e-03  kl=4.6691e-03  mse=2.5937e-07  mm=0.0000e+00  scale=0.298
+  step   380  loss=7.0721e-03  kl=7.0718e-03  mse=2.4678e-07  mm=0.0000e+00  scale=0.249
+  step   400  loss=5.2941e-03  kl=5.2940e-03  mse=1.2906e-07  mm=0.0000e+00  scale=0.205
+  [eval @ 400] student_vs_teacher: top1=0.9638  kl_p99=8.4272e-02  margin_p99=2.3527e-01
+  step   420  loss=7.0402e-03  kl=7.0398e-03  mse=4.5783e-07  mm=0.0000e+00  scale=0.168
+  step   440  loss=5.4569e-03  kl=5.4565e-03  mse=4.2746e-07  mm=0.0000e+00  scale=0.139
+  step   460  loss=5.3813e-03  kl=5.3811e-03  mse=1.9862e-07  mm=0.0000e+00  scale=0.117
+  step   480  loss=6.4969e-03  kl=6.4967e-03  mse=1.6919e-07  mm=0.0000e+00  scale=0.104
+  step   500  loss=8.5914e-03  kl=8.5912e-03  mse=2.2638e-07  mm=0.0000e+00  scale=0.100
+  [eval @ 500] student_vs_teacher: top1=0.9608  kl_p99=8.3567e-02  margin_p99=2.7613e-01
+[13:38:03] final eval with best.pt
+done in 646s; pre: top1=0.9624  best: top1=0.9638  post (with best ckpt): top1=0.9638

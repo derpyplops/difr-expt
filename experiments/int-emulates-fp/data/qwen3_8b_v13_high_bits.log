@@ -1,0 +1,19 @@
+[13:24:02] loading Qwen/Qwen3-8B (torch.bfloat16) on cuda
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights: 100%|██████████| 399/399 [00:00<00:00, 7925.47it/s]
+You have loaded an FP8 model on CPU and have a CUDA or XPU device available, make sure to set your model on a GPU or XPU device in order to run your model. To remove this warning, pass device_map = 'cuda' or 'xpu'. 
+Loading weights:   0%|          | 0/651 [00:00<?, ?it/s]Loading weights: 100%|██████████| 651/651 [00:00<00:00, 7360.31it/s]
+  teacher: loaded published checkpoint Qwen/Qwen3-8B-FP8
+  init_from_teacher: copied 253 weight tensors (block-fp8=252, per-row-fp8=0, plain=1)
+  student: replaced 252 Linears with IntLinear (trainable=True, include_lm_head=False)
+  student: int non-matmul counts: {'rmsnorm': 145, 'silu': 36, 'attention': 36}
+  promoted 0 biases to nn.Parameter
+  per-matmul hooks: paired 252 student↔teacher Linear modules
+  trainable groups: {'matmul': (252, 6945767424), 'gamma_bias': (145, 308224), 'luts': (0, 0)}
+  optimizer: torch.AdamW (fp32 state)
+  loaded 100 prompts from experiments/fp-emulation/data/prompts_qwen3.pt
+  train: 80  eval: 20
+[13:24:09] step 0 eval
+  pre-train: student_vs_teacher top1=0.9624  kl_p99=7.4894e-02  margin_p99=2.3527e-01
+[13:24:19] final eval with best.pt
+  steps=0 or best.pt absent → skipping reload; reusing student in-memory state
+done in 19s; pre: top1=0.9624  best: top1=0.9624  post (with best ckpt): top1=0.9624

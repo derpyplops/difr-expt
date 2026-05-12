@@ -1,0 +1,8 @@
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "teacher": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
+  "top1_base_vs_teacher": 0.9658,
+  "kl_mean": 0.005444,
+  "kl_p99": 0.037497,
+  "n_positions": 3628
+}
