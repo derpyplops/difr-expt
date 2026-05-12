@@ -78,9 +78,13 @@ class Config:
     model: str
     prompts: str
     out: str
-    teacher_precision: str = "fp4_e2m1"  # fp4_e2m1 | fp8_e4m3 | fp8_e5m2
+    teacher_source: str = "fake_quant"  # fake_quant | published
+    teacher_id: str | None = None  # required when teacher_source=published
+    teacher_precision: str = "fp4_e2m1"  # fp4_e2m1 | fp8_e4m3 | fp8_e5m2 (fake_quant only)
     teacher_block_size: int = 32
     teacher_quantize_act: bool = True
+    use_8bit_adamw: bool = False
+    grad_checkpointing: bool = False
     lr: float = 1e-5
     lr_luts: float = 1e-3
     lr_gamma_bias: float = 1e-4
@@ -274,6 +278,8 @@ def save_trained_deltas(model: nn.Module, path: Path) -> None:
 
 def build_models(
     model_name: str,
+    teacher_source: str,
+    teacher_id: str | None,
     teacher_precision: str,
     teacher_block_size: int,
     teacher_quantize_act: bool,
@@ -290,28 +296,43 @@ def build_models(
     int_embedding: bool,
     embedding_bits: int,
     keep_fp32_ref: bool = True,
+    grad_checkpointing: bool = False,
 ) -> tuple[nn.Module, nn.Module, nn.Module | None]:
     """Build (teacher, student, ref).
 
-    teacher = fp4/fp8 fake-quantized HF model (frozen).
+    teacher_source="fake_quant":  teacher = LowPrecisionLinear-patched deepcopy of base.
+    teacher_source="published":   teacher = HF checkpoint loaded from teacher_id
+                                  (compressed_tensors handles fp8, fp_quant handles NVFP4).
     student = int24 model (matmul + non-matmul + optional embedding patches).
     ref    = unmodified fp32 reference (None if `keep_fp32_ref=False`).
     """
     # Load the fp32 (or bf16) base model once.
-    base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device).eval()
+    base = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device).eval()
     for p in base.parameters():
         p.requires_grad = False
 
-    teacher = copy.deepcopy(base)
-    n_lp = patch_model_low_precision(
-        teacher,
-        precision=teacher_precision,
-        block_size=teacher_block_size,
-        include_lm_head=False,
-        quantize_act=teacher_quantize_act,
-    )
-    print(f"  teacher: replaced {len(n_lp)} Linears with LowPrecisionLinear "
-          f"(precision={teacher_precision})")
+    if teacher_source == "published":
+        assert teacher_id is not None, "teacher_id is required when teacher_source=published"
+        # HF transformers auto-detects the quantization config from the model
+        # card; compressed_tensors handles fp8, fp_quant handles NVFP4. Compute
+        # happens in `dtype` after on-the-fly dequant.
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_id, dtype=dtype).to(device).eval()
+        print(f"  teacher: loaded published checkpoint {teacher_id}")
+    elif teacher_source == "fake_quant":
+        teacher = copy.deepcopy(base)
+        n_lp = patch_model_low_precision(
+            teacher,
+            precision=teacher_precision,
+            block_size=teacher_block_size,
+            include_lm_head=False,
+            quantize_act=teacher_quantize_act,
+        )
+        print(f"  teacher: fake-quant replaced {len(n_lp)} Linears "
+              f"(precision={teacher_precision})")
+    else:
+        raise ValueError(
+            f"unknown teacher_source: {teacher_source!r} (expected fake_quant|published)"
+        )
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
@@ -337,6 +358,15 @@ def build_models(
     if int_embedding:
         emb = patch_model_int_embedding(student, bits=embedding_bits)
         print(f"  student: replaced {len(emb)} embeddings with IntEmbedding")
+    if grad_checkpointing:
+        # HF method; enables recomputation of intermediate activations during
+        # backward instead of holding them. Cuts activation memory ~5x at the
+        # cost of one extra forward per step. Important for 8B on H100 80GB.
+        if hasattr(student, "gradient_checkpointing_enable"):
+            student.gradient_checkpointing_enable()
+            print("  student: gradient checkpointing enabled")
+        else:
+            print("  student: gradient_checkpointing_enable() not available — skipping")
 
     ref = base if keep_fp32_ref else None
     if ref is None:
@@ -349,11 +379,26 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompts", required=True, help=".pt from cache_prompts.py")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--teacher-source", default="fake_quant",
+                    choices=["fake_quant", "published"],
+                    help="fake_quant: patch base model with LowPrecisionLinear. "
+                         "published: load --teacher-id via HF (needs compressed_tensors for fp8, "
+                         "fp_quant for NVFP4).")
+    ap.add_argument("--teacher-id", default=None,
+                    help="HF model id for published teacher (e.g. RedHatAI/Qwen2.5-0.5B-FP8-dynamic). "
+                         "Required when --teacher-source=published.")
     ap.add_argument("--teacher-precision", default="fp4_e2m1",
-                    choices=["fp4_e2m1", "fp8_e4m3", "fp8_e5m2"])
+                    choices=["fp4_e2m1", "fp8_e4m3", "fp8_e5m2"],
+                    help="Only used when --teacher-source=fake_quant.")
     ap.add_argument("--teacher-block-size", type=int, default=32)
     ap.add_argument("--teacher-no-quantize-act", action="store_true",
-                    help="Skip teacher activation quant (weight-only fp4/fp8)")
+                    help="Skip teacher activation quant (weight-only fp4/fp8); fake_quant only.")
+    ap.add_argument("--use-8bit-adamw", action="store_true",
+                    help="Use bitsandbytes 8-bit AdamW instead of torch AdamW. "
+                         "Needed to fit 8B models on H100 80GB.")
+    ap.add_argument("--grad-checkpointing", action="store_true",
+                    help="Enable gradient checkpointing on the student. "
+                         "Needed for 8B activation memory.")
     ap.add_argument("--lr", type=float, default=1e-5,
                     help="LR for matmul weight shadows.")
     ap.add_argument("--lr-luts", type=float, default=1e-3)
@@ -393,9 +438,13 @@ def main():
         model=args.model,
         prompts=args.prompts,
         out=args.out,
+        teacher_source=args.teacher_source,
+        teacher_id=args.teacher_id,
         teacher_precision=args.teacher_precision,
         teacher_block_size=args.teacher_block_size,
         teacher_quantize_act=not args.teacher_no_quantize_act,
+        use_8bit_adamw=args.use_8bit_adamw,
+        grad_checkpointing=args.grad_checkpointing,
         lr=args.lr,
         lr_luts=args.lr_luts,
         lr_gamma_bias=args.lr_gamma_bias,
@@ -438,8 +487,12 @@ def main():
     if pad_id is None:
         pad_id = 0
 
+    if cfg.teacher_source == "published" and cfg.teacher_id is None:
+        raise SystemExit("--teacher-id is required when --teacher-source=published")
     teacher, student, ref = build_models(
         model_name=cfg.model,
+        teacher_source=cfg.teacher_source,
+        teacher_id=cfg.teacher_id,
         teacher_precision=cfg.teacher_precision,
         teacher_block_size=cfg.teacher_block_size,
         teacher_quantize_act=cfg.teacher_quantize_act,
@@ -456,6 +509,7 @@ def main():
         int_embedding=cfg.int_embedding,
         embedding_bits=cfg.embedding_bits,
         keep_fp32_ref=not args.no_fp32_ref,
+        grad_checkpointing=cfg.grad_checkpointing,
     )
 
     n_biases = promote_intlinear_biases(student)
@@ -484,7 +538,18 @@ def main():
         param_groups.append({"params": [p for _, p in groups["gamma_bias"]], "lr": cfg.lr_gamma_bias})
     if groups["luts"]:
         param_groups.append({"params": [p for _, p in groups["luts"]], "lr": cfg.lr_luts})
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+    if cfg.use_8bit_adamw:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as e:
+            raise SystemExit(
+                "--use-8bit-adamw requires bitsandbytes (pip install bitsandbytes)"
+            ) from e
+        optimizer = bnb.optim.AdamW8bit(param_groups, weight_decay=0.0)
+        print("  optimizer: bnb.AdamW8bit")
+    else:
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+        print("  optimizer: torch.AdamW (fp32 state)")
 
     prompts: list[torch.Tensor] = torch.load(cfg.prompts, weights_only=False)
     print(f"  loaded {len(prompts)} prompts from {cfg.prompts}")
