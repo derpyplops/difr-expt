@@ -14,15 +14,19 @@ PY=${PYTHON:-python3}
 
 # Run config: (base_model, teacher_id, prompts_file, out_subdir, extra_flags)
 # LR-luts 1e-5 (NOT the 1e-3 default — that destroyed the softmax LUT in
-# Run 1 of the prior attempt, collapsing top-1 from 0.91 to 0.008 by step 100).
-COMMON="--lr 1e-5 --lr-luts 1e-5 --lr-gamma-bias 1e-4"
+# the first attempt, collapsing top-1 from 0.91 to 0.008 by step 100).
+# 8B runs use 5x lower LRs + 2.5x longer warmup + tighter grad clip — at the
+# original 1e-5 LR + 8-bit AdamW + warmup=20, Qwen3-8B diverged at warmup
+# peak (loss 0.018 → 3.77 between step 1 and step 20).
+SMALL="--lr 1e-5 --lr-luts 1e-5 --lr-gamma-bias 1e-4 --warmup 20 --grad-clip 1.0"
+BIG="--lr 2e-6 --lr-luts 2e-6 --lr-gamma-bias 2e-5 --warmup 50 --grad-clip 0.5"
 
 RUNS=(
-    "Qwen/Qwen2.5-0.5B|RedHatAI/Qwen2.5-0.5B-FP8-dynamic|prompts_qwen25.pt|qwen25_fp8|$COMMON"
-    "Qwen/Qwen3-8B|Qwen/Qwen3-8B-FP8|prompts_qwen3.pt|qwen3_8b_fp8|$COMMON --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
-    "Qwen/Qwen3-8B|nvidia/Qwen3-8B-NVFP4|prompts_qwen3.pt|qwen3_8b_nvfp4|$COMMON --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
-    "meta-llama/Llama-3.1-8B-Instruct|RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic|prompts_llama31.pt|llama31_8b_fp8|$COMMON --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
-    "meta-llama/Llama-3.1-8B-Instruct|nvidia/Llama-3.1-8B-Instruct-NVFP4|prompts_llama31.pt|llama31_8b_nvfp4|$COMMON --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
+    "Qwen/Qwen2.5-0.5B|RedHatAI/Qwen2.5-0.5B-FP8-dynamic|prompts_qwen25.pt|qwen25_fp8|$SMALL"
+    "Qwen/Qwen3-8B|Qwen/Qwen3-8B-FP8|prompts_qwen3.pt|qwen3_8b_fp8|$BIG --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
+    "Qwen/Qwen3-8B|nvidia/Qwen3-8B-NVFP4|prompts_qwen3.pt|qwen3_8b_nvfp4|$BIG --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
+    "meta-llama/Llama-3.1-8B-Instruct|RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic|prompts_llama31.pt|llama31_8b_fp8|$BIG --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
+    "meta-llama/Llama-3.1-8B-Instruct|nvidia/Llama-3.1-8B-Instruct-NVFP4|prompts_llama31.pt|llama31_8b_nvfp4|$BIG --use-8bit-adamw --grad-checkpointing --no-fp32-ref"
 )
 
 INDEXES=("$@")

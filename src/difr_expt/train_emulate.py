@@ -700,8 +700,15 @@ def main():
     save_trained_deltas(student, out_dir / "final.pt")
     # Final eval with the best checkpoint reloaded.
     print(f"[{time.strftime('%H:%M:%S')}] final eval with best.pt")
-    # Load best deltas back into student.
-    payload = torch.load(out_dir / "best.pt", weights_only=False, map_location=device)
+    # On 8B, the optimizer state + student + grads occupy ~75 GB; loading best.pt
+    # (30 GB) directly to GPU on top of that OOMs the 80 GB H100. Free optimizer
+    # first, then load checkpoint to CPU and transfer per-tensor below.
+    del optimizer
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    payload = torch.load(out_dir / "best.pt", weights_only=False, map_location="cpu")
     gammas = payload.get("rmsnorm_gamma", {})
     biases = payload.get("linear_bias", {})
     weights = payload.get("linear_weight_fp", {})
