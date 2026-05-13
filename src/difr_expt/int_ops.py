@@ -275,9 +275,12 @@ class IntRMSNorm(nn.Module):
 
         # Step 7: dequant: (prod_i64) * x_scale * g_scale * r  →  fp32 output.
         # The float multiply by (x_scale * g_scale * r) is a public-scale multiply.
-        scale_combined = (x_scale.to(torch.float32) * float(g_scale) * r)
+        # `r` is already on the same device as the int pipeline (cpu when on cuda
+        # target, gpu otherwise); pair `x_scale` to match.
         if target_device.type == "cuda":
-            scale_combined = scale_combined.cpu()
+            scale_combined = (x_scale.cpu().to(torch.float32) * float(g_scale) * r)
+        else:
+            scale_combined = (x_scale.to(torch.float32) * float(g_scale) * r)
         out = prod_i64.to(torch.float32) * scale_combined
 
         if target_device.type == "cuda":

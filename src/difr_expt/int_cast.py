@@ -292,6 +292,7 @@ class IntLinear(nn.Module):
     """
 
     true_int_matmul: bool = False
+    int8_gpu_matmul: bool = False  # use torch._int_mm at int8 precision (lossy from int24)
 
     def __init__(
         self,
@@ -719,12 +720,50 @@ class IntLinear(nn.Module):
             accum = torch.matmul(x_i64, w_i64.t())
         return accum.to(torch.float32) * x_scale * self.weight_scale.t()
 
+    def _int8_gpu_path(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """Real int8 × int8 → int32 GPU matmul via torch._int_mm.
+
+        Fast (cuBLAS) alternative to the CPU int64 path. Operates at int8
+        precision regardless of how weight_int is stored — runtime requant.
+        torch._int_mm requires M >= 17; falls back to CPU int64 for shorter.
+        """
+        # Per-token int8 activation quant.
+        qmax_a = 127.0
+        absmax_a = x_flat.detach().abs().to(torch.float32).amax(
+            dim=-1, keepdim=True).clamp_min(1e-30)
+        a_scale = absmax_a / qmax_a
+        a_int8 = (x_flat.to(torch.float32) / a_scale).round().clamp(
+            -127, 127).to(torch.int8)
+        # Per-row int8 weight quant (from stored int + scale → fp32 → re-quant).
+        if not hasattr(self, "_int8_cache_w") or self._int8_cache_w is None:
+            w_fp32 = self.weight_int.to(torch.float32) * self.weight_scale
+            qmax_w = 127.0
+            absmax_w = w_fp32.abs().amax(dim=1, keepdim=True).clamp_min(1e-30)
+            w_scale8 = absmax_w / qmax_w
+            w_int8 = (w_fp32 / w_scale8).round().clamp(-127, 127).to(torch.int8)
+            self.register_buffer("_int8_cache_w", w_int8.contiguous(), persistent=False)
+            self.register_buffer("_int8_cache_w_scale", w_scale8.to(torch.float32),
+                                 persistent=False)
+        if x_flat.shape[0] >= 17:
+            # torch._int_mm wants row-major a [M, K] and column-major b [N, K] → b.t()
+            accum = torch._int_mm(a_int8.contiguous(),
+                                  self._int8_cache_w.t().contiguous())
+        else:
+            # CPU fallback for tiny M (e.g. single-token decode).
+            accum = torch.matmul(
+                a_int8.to(torch.int64).cpu(),
+                self._int8_cache_w.to(torch.int64).cpu().t(),
+            ).to(x_flat.device).to(torch.int32)
+        return accum.to(torch.float32) * a_scale * self._int8_cache_w_scale.t()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_flat = x.reshape(-1, orig_shape[-1])
         bias_already_applied = False
         if self.trainable:
             out_flat = self._trainable_forward(x_flat)
+        elif self.int8_gpu_matmul:
+            out_flat = self._int8_gpu_path(x_flat)
         elif self.true_int_matmul:
             out_flat = self._true_int_path(x_flat)
         else:
@@ -757,6 +796,13 @@ def set_true_int_matmul(model: nn.Module, value: bool) -> None:
     for m in model.modules():
         if isinstance(m, IntLinear):
             m.true_int_matmul = value
+
+
+def set_int8_gpu_matmul(model: nn.Module, value: bool) -> None:
+    """Toggle the GPU int8 matmul path (torch._int_mm) on every IntLinear."""
+    for m in model.modules():
+        if isinstance(m, IntLinear):
+            m.int8_gpu_matmul = value
 
 
 def calibrate_smooth_scales(

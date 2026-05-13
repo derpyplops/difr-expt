@@ -76,6 +76,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--keep-fp32-ref", action="store_true",
                     help="Also report student_vs_ref / teacher_vs_ref where ref = bf16 base model. Triples memory; off by default.")
+    ap.add_argument("--true-int-matmul", action="store_true",
+                    help="Literal int64 × int64 matmul for IntLinear (CPU fallback on CUDA, slow).")
+    ap.add_argument("--true-int-nonmatmul", action="store_true",
+                    help="Literal int execution for RMSNorm/SiLU/softmax/attention matmul ops (CPU fallback on CUDA).")
+    ap.add_argument("--int8-gpu-matmul", action="store_true",
+                    help="Use torch._int_mm at int8 precision for matmul (fast GPU; lossy from int24).")
     args = ap.parse_args()
 
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32, "float16": torch.float16}[args.dtype]
@@ -114,6 +120,18 @@ def main():
         int_nonmatmul_bitexact=False,
     )
 
+    if args.true_int_matmul:
+        from difr_expt.int_cast import set_true_int_matmul
+        set_true_int_matmul(student, True)
+        print("  set true_int_matmul=True on IntLinears (CPU int64 fallback on CUDA — slow)")
+    if args.int8_gpu_matmul:
+        from difr_expt.int_cast import set_int8_gpu_matmul
+        set_int8_gpu_matmul(student, True)
+        print("  set int8_gpu_matmul=True on IntLinears (torch._int_mm; runtime int8 quant)")
+    if args.true_int_nonmatmul:
+        from difr_expt.int_ops import set_true_int_path
+        set_true_int_path(student, True)
+        print("  set true_int_path=True for non-matmul ops (CPU int64 fallback on CUDA)")
     if args.activation_scheme in ("fp8_e4m3", "block_fp8_e4m3"):
         from difr_expt.int_cast import IntLinear as _IL
         n_set = 0
