@@ -504,10 +504,11 @@ class IntLinear(nn.Module):
         if (scheme == "block_fp8_e4m3"
                 and getattr(self, "use_block_fp8_kernel_path", False)
                 and self.block_fp8_weight is not None):
-            from transformers.integrations.finegrained_fp8 import (
-                act_quant as _block_fp8_act_quant,
-                w8a8_block_fp8_matmul as _block_fp8_matmul,
-            )
+            from transformers.integrations.finegrained_fp8 import act_quant as _block_fp8_act_quant
+            try:
+                from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul as _block_fp8_matmul
+            except ImportError:
+                from transformers.integrations.finegrained_fp8 import w8a8_block_fp8_matmul_triton as _block_fp8_matmul
             bs = getattr(self, "activation_block_size", 128)
             x_flat_c = x_flat.contiguous()
             qx, sx = _block_fp8_act_quant(x_flat_c, bs)

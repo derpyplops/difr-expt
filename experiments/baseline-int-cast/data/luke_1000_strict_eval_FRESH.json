@@ -1,0 +1,48 @@
+{
+  "n_positions": 15348,
+  "n_prompts": 100,
+  "all": {
+    "top1_match": 0.9355617165565491,
+    "top5_overlap": 0.9325645565986633,
+    "logit_l2": 78.22438049316406,
+    "kl_ref_cand": 0.0136877978220582,
+    "gumbel_margin": 0.014159194193780422,
+    "logit_l2_p50": 68.56919860839844,
+    "logit_l2_p99": 211.36439514160156,
+    "logit_l2_max": 1141.683349609375,
+    "kl_ref_cand_p50": 0.006767840124666691,
+    "kl_ref_cand_p99": 0.13607749342918396,
+    "kl_ref_cand_max": 1.9912374019622803,
+    "gumbel_margin_p50": 0.0,
+    "gumbel_margin_p99": 0.3271869719028473,
+    "gumbel_margin_max": 6.18994140625
+  },
+  "last": {
+    "top1_match": 0.9300000071525574,
+    "top5_overlap": 0.9139999151229858,
+    "logit_l2": 75.20046997070312,
+    "kl_ref_cand": 0.014012234285473824,
+    "gumbel_margin": 0.014399785548448563,
+    "logit_l2_p50": 70.49993133544922,
+    "logit_l2_p99": 133.2981414794922,
+    "logit_l2_max": 139.45364379882812,
+    "kl_ref_cand_p50": 0.010368562303483486,
+    "kl_ref_cand_p99": 0.04292276129126549,
+    "kl_ref_cand_max": 0.19716426730155945,
+    "gumbel_margin_p50": 0.0,
+    "gumbel_margin_p99": 0.31402745842933655,
+    "gumbel_margin_max": 0.3521308898925781
+  },
+  "wallclock_s": 7.4750847816467285,
+  "config": {
+    "ref_model": "Qwen/Qwen2.5-0.5B",
+    "teacher_model": "RedHatAI/Qwen2.5-0.5B-FP8-dynamic",
+    "student_state": "/root/luke_1000/student_state_dict.pt",
+    "ref_dtype": "bfloat16",
+    "n_prompts": 100,
+    "max_len": 512,
+    "weight_bits": 16,
+    "activation_bits": 16,
+    "eval_path": "fake_quant_float (Luke Int32LinearSTE forward, use_integer_matmul=False)"
+  }
+}

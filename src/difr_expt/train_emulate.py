@@ -582,8 +582,12 @@ def build_models(
                 Sexp = S.repeat_interleave(bh, dim=0).repeat_interleave(bw, dim=1)
                 w_fp = W * Sexp
                 n_block += 1
-            elif isinstance(tm, CompressedLinear):
-                # Per-row fp8 dequant
+            elif (isinstance(tm, CompressedLinear)
+                    or (hasattr(tm, "weight_scale")
+                        and getattr(tm.weight, "dtype", None) == torch.float8_e4m3fn)):
+                # Per-row fp8 dequant. Newer transformers/compressed-tensors load
+                # per-row fp8 as a plain nn.Linear with weight (fp8) + weight_scale,
+                # not a CompressedLinear subclass — so check both forms.
                 w_fp = tm.weight.float() * tm.weight_scale.float()
                 n_perrow += 1
             elif (isinstance(tm, nn.Linear)
