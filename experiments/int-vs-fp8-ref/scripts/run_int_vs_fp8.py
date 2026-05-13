@@ -82,6 +82,13 @@ def main():
                     help="Literal int execution for RMSNorm/SiLU/softmax/attention matmul ops (CPU fallback on CUDA).")
     ap.add_argument("--int8-gpu-matmul", action="store_true",
                     help="Use torch._int_mm at int8 precision for matmul (fast GPU; lossy from int24).")
+    ap.add_argument("--act-clip-quantile", type=float, default=None,
+                    help="Per-token activation clip quantile (e.g. 0.999). Tames outlier-channel scale compression.")
+    ap.add_argument("--no-int-rmsnorm", action="store_true")
+    ap.add_argument("--no-int-softmax", action="store_true")
+    ap.add_argument("--no-int-silu", action="store_true")
+    ap.add_argument("--no-int-attn-matmul", action="store_true")
+    ap.add_argument("--no-int-rope", action="store_true")
     args = ap.parse_args()
 
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32, "float16": torch.float16}[args.dtype]
@@ -116,9 +123,29 @@ def main():
         int_lm_head=args.int_lm_head,
         init_from_teacher=True,
         keep_fp32_ref=args.keep_fp32_ref,
-        patch_nonmatmul=not args.no_patch_nonmatmul,
+        patch_nonmatmul=False,  # we'll re-patch below with selective ops
         int_nonmatmul_bitexact=False,
     )
+
+    # Re-patch non-matmul ops with per-op ablation flags.
+    if not args.no_patch_nonmatmul:
+        from difr_expt.patch_hf_model import IntOpsConfig as _Cfg, patch_model_int_nonmatmul as _patch
+        ops_cfg = _Cfg(
+            rmsnorm_bits=args.rmsnorm_bits,
+            softmax_lut_size=args.softmax_lut_size,
+            softmax_x_min=-16.0,
+            silu_lut_size=args.silu_lut_size,
+            attn_matmul_bits=args.attn_matmul_bits,
+            replace_rmsnorm=not args.no_int_rmsnorm,
+            replace_softmax=not args.no_int_softmax,
+            replace_silu=not args.no_int_silu,
+            replace_attn_matmul=not args.no_int_attn_matmul,
+            replace_rope=not args.no_int_rope,
+        )
+        counts = _patch(student, ops_cfg)
+        print(f"  int non-matmul counts: {counts} (ablations: "
+              f"no_rms={args.no_int_rmsnorm} no_sm={args.no_int_softmax} "
+              f"no_silu={args.no_int_silu} no_attn={args.no_int_attn_matmul} no_rope={args.no_int_rope})")
 
     if args.true_int_matmul:
         from difr_expt.int_cast import set_true_int_matmul
@@ -128,6 +155,14 @@ def main():
         from difr_expt.int_cast import set_int8_gpu_matmul
         set_int8_gpu_matmul(student, True)
         print("  set int8_gpu_matmul=True on IntLinears (torch._int_mm; runtime int8 quant)")
+    if args.act_clip_quantile is not None:
+        from difr_expt.int_cast import IntLinear as _IL
+        n = 0
+        for m in student.modules():
+            if isinstance(m, _IL):
+                m.act_clip_quantile = args.act_clip_quantile
+                n += 1
+        print(f"  set act_clip_quantile={args.act_clip_quantile} on {n} IntLinears")
     if args.true_int_nonmatmul:
         from difr_expt.int_ops import set_true_int_path
         set_true_int_path(student, True)
