@@ -1,6 +1,6 @@
-# Fully-int Forward Pass Matches BF16 Production Inference Within ±0.10% PPL
+# Fully-int Forward Pass Matches BF16 Production Inference Within ±0.16% PPL
 
-Across 11 production-grade language models (4 families, 0.5B to 14B parameters), we build two complementary ZK-provable int24 forward-pass recipes and measure their wikitext-103 perplexity against the corresponding bf16 production reference (sdpa attention). The **matmul-only** recipe — ZK-prove the matmul operations, leave the small non-matmul ops as bf16 — matches bf16 sdpa within ±0.10% PPL on every model tested. The **fully-int** recipe — every op (matmul, RMSNorm, SiLU, softmax, attention Q@K + P@V, RoPE, embedding) committed as int24 with public per-row / per-token / per-tensor fp32 scales — matches bf16 sdpa within ±0.4% on 8/11 models; the remaining 3 are bottlenecked by a pre-existing transformers numerical-stability bug in bf16 eager attention, not by integer quantization.
+Across 12 production-grade language models (5 families, 0.5B to 8B parameters), we build two complementary ZK-provable int24 forward-pass recipes and measure their wikitext-103 perplexity against the corresponding bf16 production reference (sdpa attention). The **matmul-only** recipe — ZK-prove the matmul operations, leave the small non-matmul ops as bf16 — matches bf16 sdpa within ±0.16% PPL on every model tested. The **fully-int** recipe — every op (matmul, RMSNorm, SiLU, softmax, attention Q@K + P@V, RoPE, embedding) committed as int24 with public per-row / per-token / per-tensor fp32 scales — matches bf16 sdpa within ±0.4% on 9/12 models; the remaining 3 are bottlenecked by a pre-existing transformers numerical-stability bug in bf16 eager attention, not by integer quantization.
 
 **Date:** 2026-05-13. **Compute:** Lambda 2× H100 SXM5, ≈ $30 spend.
 
@@ -23,6 +23,7 @@ Across 11 production-grade language models (4 families, 0.5B to 14B parameters),
 | Llama-3.2-3B-Instruct | 19.046 | 19.041 | -0.02% |
 | Llama-3.1-8B-Instruct | 13.549 | 13.560 | +0.08% |
 | Phi-4-mini-Instruct   | 20.512 | 20.545 | +0.16% |
+| SmolLM3-3B            | 19.928 | 19.932 | +0.02% |
 
 All 11 models within ±0.16% of bf16 sdpa. Range −0.02% (Qwen2.5-1.5B / Llama-3.2-3B-Instruct) to +0.16% (Phi-4-mini-Instruct).
 
@@ -41,6 +42,7 @@ All 11 models within ±0.16% of bf16 sdpa. Range −0.02% (Qwen2.5-1.5B / Llama-
 | Llama-3.2-3B-Instruct | 19.05 | 19.03 | 19.29 | 19.04 | -0.05% | +0.04% |
 | Llama-3.1-8B-Instruct | 13.55 | 13.55 | 13.66 | 13.55 | 0.00%  | 0.00%  |
 | Phi-4-mini-Instruct   | 20.51 | 20.48 | 21.10 | 20.53 | +0.08% | +0.24% |
+| SmolLM3-3B            | 19.93 | 19.93 | 20.10 | 19.92 | -0.06% | -0.06% |
 
 8/11 models within ±0.4% of bf16 sdpa.
 
