@@ -1,144 +1,196 @@
-# Full int model — pipeline diagrams
+# Bit-exact int emulation — pipeline per model
 
-Diagrams render natively on GitHub. Code paths: `src/difr_expt/train_emulate.py` (build + eval),
-`src/difr_expt/int_cast.py` (`IntLinear`), `src/difr_expt/int_ops_bitexact.py` (`IntCommitWrap`).
+Zero training. The student is built once from the teacher and evaluated. Top-1 = 1.0000 on each
+of the three models, KL = 0, Gumbel margin = 0 across ~320k held-out positions each
+(see [full_int_model.md](full_int_model.md)).
 
-## 1. Top-level pipeline
+Code paths: `src/difr_expt/train_emulate.py::build_models` (cast + patch),
+`src/difr_expt/int_cast.py::IntLinear` (matmul forward),
+`src/difr_expt/int_ops_bitexact.py::IntCommitWrap` (RMSNorm/SiLU commit).
+
+---
+
+## Qwen2.5-0.5B — per-row fp8 recipe
+
+Teacher: `RedHatAI/Qwen2.5-0.5B-FP8-dynamic` (per-row fp8 e4m3 weights, per-token fp8 dynamic
+activations). 24 transformer blocks, hidden=896, 14 heads × head_dim=64. **n_positions=318,091
+→ top-1 = 1.0000.**
 
 ```mermaid
-flowchart LR
-  T[Published fp8 teacher<br/>RedHatAI/...-FP8-dynamic or<br/>Qwen/Qwen3-8B-FP8]
-  B[Base model bf16<br/>Qwen2.5-0.5B / Llama-3.1-8B / Qwen3-8B]
-  T --> Init
-  B --> Patch
-  subgraph BUILD[build_models]
-    Init[init_from_teacher<br/>copy fp8→bf16 dequant weights<br/>stash fp8+scale_inv for block-fp8]
-    Patch[patch_model_int_cast<br/>nn.Linear → IntLinear x N]
-    Wrap[patch_model_int_bitexact<br/>RMSNorm/SiLU → IntCommitWrap]
-    Init --> Patch --> Wrap
+flowchart TB
+  T0[Teacher CompressedLinear<br/>fp8 e4m3 weight + fp32 weight_scale per row]
+  T0 -->|"W_bf16 = W_fp8 · weight_scale"| INIT[student.weight_fp ← W_bf16]
+  INIT --> S0[Student IntLinear init]
+
+  subgraph BLOCK[One transformer block, x24]
+    direction TB
+    X0[hidden_states bf16] --> N1[IntCommitWrap RMSNorm]
+    N1 -- bf16 == int30·s --> QKV{q_proj / k_proj / v_proj<br/>IntLinear}
+    QKV --> QN[IntCommitWrap q_norm/k_norm]
+    QN --> RoPE[RoPE]
+    RoPE --> SDPA["Q · K.T → softmax → P · V<br/>eager bf16 path"]
+    SDPA --> O[IntLinear o_proj]
+    O --> R1((+))
+    X0 --> R1
+    R1 --> N2[IntCommitWrap RMSNorm]
+    N2 --> GU{gate_proj / up_proj<br/>IntLinear}
+    GU --> SI[IntCommitWrap SiLU]
+    SI --> MUL((×))
+    MUL --> D[IntLinear down_proj]
+    D --> R2((+))
+    R1 --> R2
+    R2 --> Y[hidden_states bf16]
   end
-  Wrap --> S[Student model]
-  S --> Loop{steps > 0?}
-  Loop -- yes --> Train[Training loop<br/>logit-KL + Gumbel margin loss]
-  Loop -- no --> Eval[evaluate]
-  Train --> Eval
-  Eval --> M[top-1, top-5, KL, Gumbel margin<br/>L1/L2/MAE, cosine]
-  Eval -.compares.- T
+
+  S0 -.weight_fp.- BLOCK
+
+  Y --> LMH[lm_head F.linear bf16] --> LOG[logits]
+  LOG --> CMP[top-1 vs teacher = 1.0000]
+
+  classDef commit fill:#cfe8d2,stroke:#1f9b54
+  classDef matmul fill:#d6e4f4,stroke:#2a5fa0
+  class N1,N2,QN,SI commit
+  class QKV,O,GU,D,LMH matmul
 ```
 
-## 2. Per-block forward pass — where int commits live
-
-```mermaid
-flowchart TB
-  X0[hidden_states bf16] --> N1[IntCommitWrap<br/>input_layernorm RMSNorm]
-  N1 -- bf16 = int30·s --> Q[IntLinear q_proj]
-  N1 -- bf16 = int30·s --> K[IntLinear k_proj]
-  N1 -- bf16 = int30·s --> V[IntLinear v_proj]
-  Q --> QN[IntCommitWrap<br/>q_norm RMSNorm]
-  K --> KN[IntCommitWrap<br/>k_norm RMSNorm]
-  QN --> RoPE[RoPE rotation]
-  KN --> RoPE
-  RoPE --> SDPA["Q · K.T → softmax → P · V<br/>(eager bf16 path; Q/K/V already int30-committed)"]
-  V --> SDPA
-  SDPA --> O[IntLinear o_proj]
-  O --> R1((+))
-  X0 --> R1
-  R1 --> N2[IntCommitWrap<br/>post_attention_layernorm RMSNorm]
-  N2 --> G[IntLinear gate_proj]
-  N2 --> U[IntLinear up_proj]
-  G --> SI[IntCommitWrap<br/>act_fn SiLU]
-  SI --> MUL((×))
-  U --> MUL
-  MUL --> D[IntLinear down_proj]
-  D --> R2((+))
-  R1 --> R2
-  R2 --> Y[hidden_states bf16]
-
-  style N1 fill:#cfe8d2,stroke:#1f9b54
-  style N2 fill:#cfe8d2,stroke:#1f9b54
-  style QN fill:#cfe8d2,stroke:#1f9b54
-  style KN fill:#cfe8d2,stroke:#1f9b54
-  style SI fill:#cfe8d2,stroke:#1f9b54
-  style Q fill:#d6e4f4,stroke:#2a5fa0
-  style K fill:#d6e4f4,stroke:#2a5fa0
-  style V fill:#d6e4f4,stroke:#2a5fa0
-  style O fill:#d6e4f4,stroke:#2a5fa0
-  style G fill:#d6e4f4,stroke:#2a5fa0
-  style U fill:#d6e4f4,stroke:#2a5fa0
-  style D fill:#d6e4f4,stroke:#2a5fa0
-```
-
-Green nodes = `IntCommitWrap` (int30 bf16 round-trip = identity, makes commitment visible).
-Blue nodes = `IntLinear` (int operands + matmul kernel; details below).
-
-## 3. `IntLinear` forward — branches by activation scheme
-
-```mermaid
-flowchart TB
-  X[x bf16] --> AS{activation_scheme}
-
-  AS -->|fp8_e4m3<br/>per-token| AQ1[fake_quantize_per_token_fp8_e4m3_ste<br/>x → bf16 on fp8 e4m3 grid 256 levels<br/>per-token absmax computed in bf16]
-  AS -->|block_fp8_e4m3<br/>per-128-block| AQ2[fake_quantize_block_fp8_e4m3_ste<br/>x → bf16 on fp8 e4m3 grid<br/>per-128-block absmax]
-  AS -->|uniform default| AQ3[per-token int24 STE]
-
-  AQ1 --> M1{int_matmul_path?}
-  M1 -->|yes| IM["int30 quant x_q & W per-token/per-row<br/>round-trip identity on bf16<br/>F.linear on dequant bf16"]
-  M1 -->|no| FL1["F.linear(x_q, W)"]
-
-  AQ2 --> M2{block_fp8_kernel_path?}
-  M2 -->|yes| BK["w8a8_block_fp8_matmul<br/>stashed teacher fp8 weight + scale_inv<br/>activation via teacher's act_quant Triton kernel<br/>per-K-block fp32 accumulator"]
-  M2 -->|no| FL2["F.linear(x_q, W) on bf16 dequant W<br/>this is the 0.953 path (kernel mismatch)"]
-
-  AQ3 --> STE[uniform int24 STE x @ W.T]
-
-  IM --> Y[y bf16]
-  FL1 --> Y
-  BK --> Y
-  FL2 --> Y
-  STE --> Y
-
-  style IM fill:#cfe8d2,stroke:#1f9b54
-  style BK fill:#cfe8d2,stroke:#1f9b54
-  style FL2 fill:#f5d4d0,stroke:#c4514a
-  style STE fill:#fbe6c4,stroke:#b07013
-```
-
-Green = bit-exact-teacher paths used in this experiment.
-Red = block-fp8 fallback that gives top-1 ≈ 0.953 (kernel mismatch).
-Yellow = legacy uniform-int24 path (gives top-1 ≈ 0.93, not used in the final result).
-
-## 4. Per-position eval
+**Inside each `IntLinear` (Qwen0.5B path):**
 
 ```mermaid
 flowchart LR
-  P[held-out prompt] --> TF[teacher forward<br/>fp8 dynamic]
-  P --> SF[student forward<br/>full int model]
-  TF --> ZR[z_ref logits]
-  SF --> ZC[z_cand logits]
-  G[Gumbel0,1 noise<br/>same draw for both] --> M
-  ZR --> M[post_gumbel_margin<br/>δ = max ZR+g − ZR+g at argmax ZC+g]
-  ZC --> M
-  ZR --> T1[top-1 match: argmax ZR == argmax ZC]
-  ZC --> T1
-  ZR --> KL[KL ZR || ZC]
-  ZC --> KL
-  M --> Agg[Aggregate over ~320k positions per model]
-  T1 --> Agg
-  KL --> Agg
-  Agg --> Out[top-1 / KL / margin tables and figure]
+  x[x bf16] --> A1[per-token fp8 e4m3 quant<br/>absmax in input dtype bf16<br/>round to 256-level grid]
+  A1 -- x_q bf16 --> Q1[per-token int30 commit<br/>x_int = round x_q/scale<br/>scale = absmax/2^29]
+  W[weight_fp bf16<br/>from init_from_teacher] --> Q2[per-row int30 commit<br/>w_int + w_scale]
+  Q1 -- bf16 dequant identity --> FL[F.linear bf16 GEMM<br/>cuBLAS deterministic]
+  Q2 -- bf16 dequant identity --> FL
+  FL --> y[y bf16]
+
+  classDef path fill:#cfe8d2,stroke:#1f9b54
+  class A1,Q1,Q2,FL path
 ```
 
-## What "full int" means at each surface
+CLI: `--activation-fp8 --int-matmul-path --int-nonmatmul-bitexact`.
 
-| Surface | int commitment | Kernel between commits |
+---
+
+## Llama-3.1-8B-Instruct — same per-row fp8 recipe
+
+Teacher: `RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic` (per-row fp8 e4m3 weights, per-token
+fp8 dynamic activations). 32 transformer blocks, hidden=4096, GQA 32 heads / 8 KV heads ×
+head_dim=128. **n_positions=317,147 → top-1 = 1.0000.**
+
+```mermaid
+flowchart TB
+  T0[Teacher CompressedLinear<br/>fp8 e4m3 weight + fp32 weight_scale per row]
+  T0 -->|"W_bf16 = W_fp8 · weight_scale"| INIT[student.weight_fp ← W_bf16]
+  INIT --> S0[Student IntLinear init]
+
+  subgraph BLOCK[One transformer block, x32]
+    direction TB
+    X0[hidden_states bf16] --> N1[IntCommitWrap RMSNorm]
+    N1 -- bf16 == int30·s --> QKV{q_proj / k_proj / v_proj<br/>IntLinear}
+    QKV --> RoPE[RoPE no q_norm/k_norm in Llama]
+    RoPE --> SDPA["Q · K.T → softmax → P · V<br/>eager bf16 path<br/>GQA: 8 KV heads repeated 4x"]
+    SDPA --> O[IntLinear o_proj]
+    O --> R1((+))
+    X0 --> R1
+    R1 --> N2[IntCommitWrap RMSNorm]
+    N2 --> GU{gate_proj / up_proj<br/>IntLinear}
+    GU --> SI[IntCommitWrap SiLU]
+    SI --> MUL((×))
+    MUL --> D[IntLinear down_proj]
+    D --> R2((+))
+    R1 --> R2
+    R2 --> Y[hidden_states bf16]
+  end
+
+  S0 -.weight_fp.- BLOCK
+
+  Y --> LMH[lm_head F.linear bf16] --> LOG[logits]
+  LOG --> CMP[top-1 vs teacher = 1.0000]
+
+  classDef commit fill:#cfe8d2,stroke:#1f9b54
+  classDef matmul fill:#d6e4f4,stroke:#2a5fa0
+  class N1,N2,SI commit
+  class QKV,O,GU,D,LMH matmul
+```
+
+`IntLinear` internals identical to Qwen0.5B (per-token fp8 + int30 + F.linear).
+CLI: `--activation-fp8 --int-matmul-path --int-nonmatmul-bitexact`.
+
+---
+
+## Qwen3-8B — block-fp8 kernel-path recipe
+
+Teacher: `Qwen/Qwen3-8B-FP8` (per-128×128-tile fp8 e4m3 weights with `weight_scale_inv`, per-128-block
+fp8 dynamic activations via Triton `act_quant`). 36 transformer blocks, hidden=4096, GQA 32 heads
+/ 8 KV heads × head_dim=128, **with** `q_norm`/`k_norm`. **n_positions=325,731 → top-1 = 1.0000.**
+
+```mermaid
+flowchart TB
+  T0[Teacher FP8Linear<br/>fp8 e4m3 weight + fp32 weight_scale_inv 128x128 tiles]
+  T0 -->|"W_bf16 = W_fp8 · Sexp<br/>(Sexp = scale_inv repeat-interleaved)"| INIT[student.weight_fp ← W_bf16]
+  T0 -->|"stash original fp8 + weight_scale_inv<br/>on IntLinear buffers"| STASH[block_fp8_weight, block_fp8_scale_inv]
+  INIT --> S0[Student IntLinear init]
+  STASH --> S0
+
+  subgraph BLOCK[One transformer block, x36]
+    direction TB
+    X0[hidden_states bf16] --> N1[RMSNorm bf16<br/>wrappers off — see report]
+    N1 --> QKV{q_proj / k_proj / v_proj<br/>IntLinear block_fp8_kernel_path}
+    QKV --> QN[q_norm/k_norm bf16<br/>Qwen3-specific]
+    QN --> RoPE[RoPE]
+    RoPE --> SDPA["Q · K.T → softmax → P · V<br/>eager bf16 path<br/>GQA 32/8 x 128"]
+    SDPA --> O[IntLinear o_proj block_fp8_kernel_path]
+    O --> R1((+))
+    X0 --> R1
+    R1 --> N2[RMSNorm bf16]
+    N2 --> GU{gate_proj / up_proj<br/>IntLinear block_fp8_kernel_path}
+    GU --> SI[SiLU bf16]
+    SI --> MUL((×))
+    MUL --> D[IntLinear down_proj block_fp8_kernel_path]
+    D --> R2((+))
+    R1 --> R2
+    R2 --> Y[hidden_states bf16]
+  end
+
+  S0 -.fp8 W + scale_inv.- BLOCK
+
+  Y --> LMH[lm_head F.linear bf16] --> LOG[logits]
+  LOG --> CMP[top-1 vs teacher = 1.0000]
+
+  classDef matmul fill:#d6e4f4,stroke:#2a5fa0
+  class QKV,O,GU,D,LMH matmul
+```
+
+**Inside each `IntLinear` (Qwen3 block-fp8 path):**
+
+```mermaid
+flowchart LR
+  x[x bf16] --> AQ["act_quant Triton kernel<br/>per-128-block absmax in fp32<br/>x → fp8_e4m3fn + per-block fp32 scale"]
+  AQ -- "qx fp8, sx fp32 [M, K/128]" --> KER
+  STW[stashed block_fp8_weight<br/>fp8 e4m3] --> KER
+  STS[stashed block_fp8_scale_inv<br/>fp32 N/128 × K/128] --> KER
+  KER["w8a8_block_fp8_matmul Triton kernel<br/>for each K-block of 128:<br/>partial = tl.dot a_fp8, b_fp8 → fp32<br/>acc += partial · a_s · b_s<br/>(scales applied per K-block, after dot)"]
+  KER --> y[y bf16]
+
+  classDef path fill:#cfe8d2,stroke:#1f9b54
+  class AQ,KER path
+```
+
+CLI: `--activation-block-fp8 --block-fp8-kernel-path` (no `--int-nonmatmul-bitexact` — the int30
+wrapper on per-head `q_norm`/`k_norm` `[..., 128]` shape loses bf16 LSBs; the kernel path doesn't
+need it). ZK spec: replace the Triton kernel with a per-K-block fp32 emulation (verified 99.99%
+bf16-bit-exact in standalone test; see [full_int_model.md](full_int_model.md) § "Block-fp8 GEMM emulation").
+
+---
+
+## Surface → int commitment
+
+| Surface | Qwen2.5-0.5B / Llama-3.1-8B | Qwen3-8B |
 |---|---|---|
-| Activation entering each Linear | per-token fp8 e4m3 (256-level grid → int8 LUT) for Qwen0.5B/Llama; per-128-block fp8 e4m3 for Qwen3 | — |
-| Weight in each Linear | per-row int30 + fp32 scale (or per-128×128-tile fp8 + scale_inv for Qwen3) | — |
-| RMSNorm input | per-token int30 + fp32 scale (round-trip identity on bf16) | torch RMSNorm (cast to fp32, pow².mean, rsqrt, multiply by gamma) |
-| SiLU input | per-token int30 + fp32 scale | torch sigmoid + multiply |
-| Attention Q/K/V | int30 from upstream `q_proj`/`k_proj`/`v_proj` IntLinear outputs | `F.linear(bf16)` plus RoPE rotation, softmax, `F.linear(bf16)` |
-| Matmul output | bf16 (next layer's commit point) | — |
-
-Every kernel between commits is a deterministic function of its committed inputs (in a ZK
-circuit, expand to fp32-on-int31 arithmetic with bf16-keyed LUTs for `rsqrt`, `exp`, `sigmoid`,
-`sin`, `cos`). The fp8 dynamic activation quant is itself a 256-entry public LUT.
+| Activation entering each Linear | per-token fp8 e4m3 (256-level → int8 LUT) | per-128-block fp8 e4m3 (Triton `act_quant`) |
+| Weight in each Linear | per-row int30 + fp32 scale (round-trip identity on bf16) | per-128×128-tile fp8 + fp32 `weight_scale_inv` (stashed from teacher) |
+| Matmul kernel | `F.linear` bf16 GEMM (deterministic) | `w8a8_block_fp8_matmul` (per-K-block fp32 accumulator) |
+| RMSNorm / SiLU input | per-token int30 + fp32 scale (`IntCommitWrap`) | bf16 (kernel path covers the commitment via upstream IntLinear outputs) |
+| Attention Q/K/V | int30 from upstream `q_proj`/`k_proj`/`v_proj` | per-128-block fp8 from upstream |
+| Matmul output → next layer | bf16, re-committed at next IntLinear's input | same |
