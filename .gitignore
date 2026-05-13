@@ -9,3 +9,6 @@ models/
 difr/
 difr/
 .claude/
+
+# Captured matmul records / residual datasets — large, regeneratable.
+experiments/int-residual/data/
