@@ -121,7 +121,22 @@ python experiments/int-vs-fp8-ref/scripts/run_ppl.py \
   --out /tmp/q7b_headline.jsonl
 ```
 
-## 8. Limitations and next steps
+## 8. Bit-precision sweep — int16 matches int24
+
+For the matmul-only recipe, we sweep weight + activation bit widths from int24 down to int8 on three representative models. The result: **int16 is essentially identical to int24** on all three; int12 introduces 0.07–0.54% PPL degradation; int8 hits 1–3%, consistent with the prior `torch._int_mm` observation that int8 is too lossy for production-quality inference.
+
+| Model | bf16 sdpa | int24 | int16 | int12 | int8 |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-7B        | 12.955 | 12.956 (+0.01%) | 12.960 (+0.04%) | 13.025 (+0.54%) | 13.350 (+3.05%) |
+| Qwen3-8B          | 20.813 | 20.834 (+0.10%) | 20.824 (+0.05%) | 20.841 (+0.13%) | 21.433 (+2.98%) |
+| Llama-3.2-3B-Inst | 19.046 | 19.041 (-0.02%) | 19.037 (-0.05%) | 19.058 (+0.07%) | 19.260 (+1.12%) |
+
+**Practical implication for ZK circuit cost:** switching from int24 to int16
+roughly halves the bit-width of every committed operand (and the matmul
+accumulator goes from int48 to int32). This is a ~33% saving in
+circuit-multiplication cost without measurable accuracy impact.
+
+## 9. Limitations and next steps
 
 * **Triton int matmul kernel.** The runtime matmul currently uses `bf16 F.linear` (bit-equivalent to int24×int24→int48 within bf16 ULP). A genuinely GPU-side int matmul kernel is the natural next step for ZK-prover-side execution. `torch._int_mm` works at int8 but loses too much precision (~5 pp top-1); a Triton kernel that decomposes int24 into int16 + int8 halves and accumulates in int32 across two `tl.dot` calls is feasible.
 * **Random-audit construction** per the proof-model rubric draft. Even if Freivalds' algorithm isn't pointwise sound under int matmul tolerance, periodic full audits at known cost cap the attacker's bits-of-control.
