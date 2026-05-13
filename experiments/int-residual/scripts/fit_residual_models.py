@@ -42,18 +42,54 @@ import torch
 FAMILY_NAMES = {0: "q", 1: "k", 2: "v", 3: "o", 4: "gate", 5: "up", 6: "down", 7: "other"}
 
 
-def load_dataset(files: list[Path]) -> dict[str, torch.Tensor]:
-    """Concatenate per-prompt flat datasets into one big in-memory table."""
+def load_dataset(
+    files: list[Path], subsample_per_matmul: int = 0, seed: int = 0
+) -> dict[str, torch.Tensor]:
+    """Concatenate per-prompt flat datasets into one big in-memory table.
+
+    If `subsample_per_matmul > 0`, retain only that many cells per
+    (matmul_id, prompt) pair. Lets us fit residual models on a small
+    representative sample of an otherwise-huge dataset without losing
+    coverage across blocks/families.
+    """
     chunks: dict[str, list] = defaultdict(list)
     meta = None
-    for f in files:
+    rng = torch.Generator().manual_seed(seed)
+    for fi, f in enumerate(files):
         blob = torch.load(f, map_location="cpu", weights_only=False)
-        for k, v in blob.items():
-            if k == "meta":
-                if meta is None:
-                    meta = v
-                continue
-            chunks[k].append(v)
+        if subsample_per_matmul > 0:
+            mid = blob["matmul_id"].to(torch.int64)
+            n = len(mid)
+            # Indexes-per-matmul: find segment boundaries assuming records are
+            # appended in matmul order (true by construction of build_residuals).
+            keep_mask = torch.zeros(n, dtype=torch.bool)
+            # Build a stable per-matmul subsample without sorting the full
+            # array each time: group via numpy.bincount equivalent.
+            unique_ids = torch.unique(mid)
+            for uid in unique_ids.tolist():
+                idxs = (mid == uid).nonzero(as_tuple=True)[0]
+                if idxs.numel() <= subsample_per_matmul:
+                    keep_mask[idxs] = True
+                else:
+                    perm = torch.randperm(idxs.numel(), generator=rng)
+                    keep_mask[idxs[perm[:subsample_per_matmul]]] = True
+            for k, v in blob.items():
+                if k == "meta":
+                    if meta is None:
+                        meta = v
+                    continue
+                if not torch.is_tensor(v):
+                    continue
+                chunks[k].append(v[keep_mask])
+        else:
+            for k, v in blob.items():
+                if k == "meta":
+                    if meta is None:
+                        meta = v
+                    continue
+                if not torch.is_tensor(v):
+                    continue
+                chunks[k].append(v)
     out: dict[str, torch.Tensor] = {}
     for k, vs in chunks.items():
         out[k] = torch.cat(vs, dim=0)
@@ -446,6 +482,417 @@ def model_R11_mixed_dotprods():
     return fn
 
 
+def model_R11a_first_order_only():
+    """R11 without the second-order term δ_X·δ_W.
+
+    2 extra K-sum-per-cell features instead of 3 — same proof cost as
+    2 extra matmuls on top of Y'. Tests how much accuracy the second-order
+    term contributes (algebra says it's bounded by K·0.25, much smaller
+    than the first-order terms).
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R11a needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Xp_dW"].to(torch.float64).numpy(),
+            train["Wp_dX"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Xp_dW"].to(torch.float64).numpy(),
+            val["Wp_dX"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "X'·δ_W", "W'·δ_X"],
+        }
+    return fn
+
+
+def model_R11b_only_XpdW():
+    """1-matmul variant: keep only X'·δ_W (drop W'·δ_X and δ_X·δ_W).
+
+    Tests whether one of the two first-order terms carries most of the
+    signal. The two terms have similar magnitude in expectation
+    (|β c_W δ_X| vs |β c_X δ_W|), so dropping one should roughly halve
+    the explained variance and bring abs error closer to R1's ~273 baseline.
+    Cost: 1 K-sum matmul over (X', δ_W).
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R11b needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Xp_dW"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Xp_dW"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "X'·δ_W"],
+        }
+    return fn
+
+
+def model_R11b_only_WpdX():
+    """1-matmul variant: keep only W'·δ_X (drop X'·δ_W and δ_X·δ_W).
+
+    Symmetric counterpart to model_R11b_only_XpdW. Useful for checking
+    whether X- or W-side rounding dominates the residual on this teacher.
+    """
+    def fn(*, train, val):
+        if "Wp_dX" not in train:
+            raise RuntimeError("R11b_W needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Wp_dX"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Wp_dX"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "W'·δ_X"],
+        }
+    return fn
+
+
+def model_R12a_mixed_signXp_dW():
+    """Mixed-precision: keep X'·δ_W exact, sign-quantize the W'·δ_X side.
+
+    Equivalent proof cost: 1 full K-sum matmul + 1 K-sum over {-1,0,+1}.
+    The sign-matmul is cheaper to commit (1 bit per δ entry).
+    Tests whether one of the two terms tolerates magnitude loss better
+    than the other.
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R12a needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Xp_dW"].to(torch.float64).numpy(),
+            train["signdX_Wp"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Xp_dW"].to(torch.float64).numpy(),
+            val["signdX_Wp"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "X'·δ_W (full)", "sign(δ_X)·W'"],
+        }
+    return fn
+
+
+def model_R12a_mixed_Xp_signdW():
+    """Symmetric counterpart: full W'·δ_X + sign-quantized X'·δ_W.
+
+    Same cost profile as R12a_mixed_signXp_dW. Run both to see if one
+    side's sign-quant is more lossy than the other.
+    """
+    def fn(*, train, val):
+        if "Wp_dX" not in train:
+            raise RuntimeError("R12a needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Wp_dX"].to(torch.float64).numpy(),
+            train["Xp_signdW"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Wp_dX"].to(torch.float64).numpy(),
+            val["Xp_signdW"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "W'·δ_X (full)", "X'·sign(δ_W)"],
+        }
+    return fn
+
+
+def model_R12_sign_quantized_delta():
+    """Approximation: replace δ with sign(δ) in the mixed dot products.
+
+    |δ| ≤ 0.5 with mean magnitude near 0.25 (assuming uniform fractional
+    parts). The 1-bit approximation drops magnitude information; expect
+    significantly worse than R11 but with the cheapest possible cost:
+    matmul over {-1, 0, +1} entries (≈ same circuit cost as a real matmul
+    but smaller commitment).
+    """
+    def fn(*, train, val):
+        if "Xp_signdW" not in train:
+            raise RuntimeError("R12 needs --compute-features in build_residuals")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        feats_tr = np.stack([
+            np.ones(N_tr, dtype=np.float64),
+            train["Xp_signdW"].to(torch.float64).numpy(),
+            train["signdX_Wp"].to(torch.float64).numpy(),
+        ], axis=1)
+        feats_va = np.stack([
+            np.ones(N_va, dtype=np.float64),
+            val["Xp_signdW"].to(torch.float64).numpy(),
+            val["signdX_Wp"].to(torch.float64).numpy(),
+        ], axis=1)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "X'·sign(δ_W)", "sign(δ_X)·W'"],
+        }
+    return fn
+
+
+def model_R11_per_family():
+    """R11 but with per-family coefficients.
+
+    Different layers have very different scale distributions; the
+    algebra coefs are universal (1, 1, -1) but the floor magnitudes per
+    family differ. Per-family fit lets the intercept absorb per-family
+    accumulator-drift bias.
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R11_per_family needs --compute-features")
+        r_hat = np.zeros(len(val["r"]), dtype=np.int64)
+        info = {"per_family_coefs": {}}
+        fam_tr = train["family"].to(torch.int64).numpy()
+        fam_va = val["family"].to(torch.int64).numpy()
+        for fcode in FAMILY_NAMES:
+            mtr = fam_tr == fcode
+            mva = fam_va == fcode
+            if mtr.sum() == 0 or mva.sum() == 0:
+                continue
+            feats_tr = np.stack([
+                np.ones(mtr.sum(), dtype=np.float64),
+                train["Xp_dW"].to(torch.float64).numpy()[mtr],
+                train["Wp_dX"].to(torch.float64).numpy()[mtr],
+                train["dX_dW"].to(torch.float64).numpy()[mtr],
+            ], axis=1)
+            feats_va = np.stack([
+                np.ones(mva.sum(), dtype=np.float64),
+                val["Xp_dW"].to(torch.float64).numpy()[mva],
+                val["Wp_dX"].to(torch.float64).numpy()[mva],
+                val["dX_dW"].to(torch.float64).numpy()[mva],
+            ], axis=1)
+            y = train["r"].to(torch.float64).numpy()[mtr]
+            r_hat_np, coefs = _lsq_int_round(feats_tr, y, feats_va)
+            r_hat[mva] = r_hat_np
+            info["per_family_coefs"][FAMILY_NAMES[fcode]] = coefs.tolist()
+        return torch.from_numpy(r_hat), info
+    return fn
+
+
+def model_R13_rank1():
+    """**Zero-K-sum** rank-1 model.
+
+    Hypothesis: most of W'·δ_X's signal is the rank-1 term
+        δ̄_X[t] · Σ_k W'[d,k] ≈ (Σ_k δ_X[t,k] / K) · Wp_sum_d[d]
+    where δ̄_X[t] is the per-token mean of δ_X (carries the skew from
+    one-sided activations). Symmetric term for the W side.
+
+    Both dX_sum_t and Wp_sum_d are O(K) commitments per row/col — committed
+    ONCE per matmul, not per cell. So this entire model uses *zero* extra
+    per-cell K-sums beyond Y'.
+
+    Features per cell (t, d):
+        1,
+        dX_sum_t[t] · Wp_sum_d[d],
+        dW_sum_d[d] · Xp_sum_t[t],
+        Wp_sum_d[d] · dX_abs_sum_t[t],   (magnitude proxy)
+        Xp_sum_t[t]  · dW_abs_sum_d[d],  (magnitude proxy)
+    """
+    def fn(*, train, val):
+        if "dX_sum_t" not in train:
+            raise RuntimeError("R13 needs build_residuals delta-summary features")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        def feats(d, N):
+            return np.stack([
+                np.ones(N, dtype=np.float64),
+                (d["dX_sum_t"].to(torch.float64) * d["Wp_sum_d"].to(torch.float64)).numpy(),
+                (d["dW_sum_d"].to(torch.float64) * d["Xp_sum_t"].to(torch.float64)).numpy(),
+                (d["Wp_sum_d"].to(torch.float64) * d["dX_abs_sum_t"].to(torch.float64)).numpy(),
+                (d["Xp_sum_t"].to(torch.float64)  * d["dW_abs_sum_d"].to(torch.float64)).numpy(),
+            ], axis=1)
+        Xt = feats(train, N_tr)
+        Xv = feats(val, N_va)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(Xt, y, Xv)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1",
+                      "dX_sum_t · Wp_sum_d",
+                      "dW_sum_d · Xp_sum_t",
+                      "Wp_sum_d · dX_abs_sum_t",
+                      "Xp_sum_t · dW_abs_sum_d"],
+        }
+    return fn
+
+
+def model_R13a_W_rank1_only():
+    """Just the W-side rank-1 term: dX_sum_t · Wp_sum_d.
+
+    Tests whether the entire W'·δ_X signal can be captured by per-token
+    δ_X mean × per-column W' sum — a true zero-K-sum model.
+    """
+    def fn(*, train, val):
+        if "dX_sum_t" not in train:
+            raise RuntimeError("R13a needs delta-summary features")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        def feats(d, N):
+            return np.stack([
+                np.ones(N, dtype=np.float64),
+                (d["dX_sum_t"].to(torch.float64) * d["Wp_sum_d"].to(torch.float64)).numpy(),
+            ], axis=1)
+        Xt = feats(train, N_tr)
+        Xv = feats(val, N_va)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(Xt, y, Xv)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "dX_sum_t · Wp_sum_d"],
+        }
+    return fn
+
+
+def model_R14_rank1_plus_WpdX():
+    """Rank-1 + the full W'·δ_X term — tests whether per-cell W'·δ_X
+    adds anything beyond the rank-1 approximation. If the asymmetry is
+    purely rank-1, this should match R11b_W exactly.
+    """
+    def fn(*, train, val):
+        if "Wp_dX" not in train:
+            raise RuntimeError("R14 needs --compute-features algebra")
+        N_tr = len(train["r"])
+        N_va = len(val["r"])
+        def feats(d, N):
+            return np.stack([
+                np.ones(N, dtype=np.float64),
+                (d["dX_sum_t"].to(torch.float64) * d["Wp_sum_d"].to(torch.float64)).numpy(),
+                (d["dW_sum_d"].to(torch.float64) * d["Xp_sum_t"].to(torch.float64)).numpy(),
+                d["Wp_dX"].to(torch.float64).numpy(),
+            ], axis=1)
+        Xt = feats(train, N_tr)
+        Xv = feats(val, N_va)
+        y = train["r"].to(torch.float64).numpy()
+        r_hat_np, coefs = _lsq_int_round(Xt, y, Xv)
+        return torch.from_numpy(r_hat_np), {
+            "coefs": coefs.tolist(),
+            "names": ["1", "dX_sum_t·Wp_sum_d", "dW_sum_d·Xp_sum_t", "W'·δ_X"],
+        }
+    return fn
+
+
+def model_R11_hybrid_byK():
+    """Per-family hybrid: R11 (3 terms) on down_proj, R11a (2 terms) elsewhere.
+
+    Motivation: δ_X·δ_W is a K-sum whose variance grows with K. On Qwen2.5-0.5B,
+    K(down_proj)=4864 vs ~896 for the other 6 families, so the dropped second-
+    order term hurts down_proj 2-3× harder. This hybrid pays the 3-matmul cost
+    only on the 1/7 family that needs it.
+
+    Weighted extra-matmul cost (per matmul invocation): R11=3, R11a=2,
+    hybrid = (6 × 2 + 1 × 3) / 7 ≈ 2.14 — basically the cost of R11a.
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R11_hybrid_byK needs --compute-features")
+        DOWN = 6  # FAMILY_CODE['down']
+        fam_tr = train["family"].to(torch.int64).numpy()
+        fam_va = val["family"].to(torch.int64).numpy()
+        r_hat = np.zeros(len(val["r"]), dtype=np.int64)
+        info = {"strategy": "R11 on down_proj (family=6), R11a elsewhere"}
+
+        # R11 (3 terms) on down_proj
+        mtr = fam_tr == DOWN
+        mva = fam_va == DOWN
+        if mtr.sum() > 0 and mva.sum() > 0:
+            feats_tr = np.stack([
+                np.ones(mtr.sum(), dtype=np.float64),
+                train["Xp_dW"].to(torch.float64).numpy()[mtr],
+                train["Wp_dX"].to(torch.float64).numpy()[mtr],
+                train["dX_dW"].to(torch.float64).numpy()[mtr],
+            ], axis=1)
+            feats_va = np.stack([
+                np.ones(mva.sum(), dtype=np.float64),
+                val["Xp_dW"].to(torch.float64).numpy()[mva],
+                val["Wp_dX"].to(torch.float64).numpy()[mva],
+                val["dX_dW"].to(torch.float64).numpy()[mva],
+            ], axis=1)
+            y = train["r"].to(torch.float64).numpy()[mtr]
+            r_hat_chunk, coefs = _lsq_int_round(feats_tr, y, feats_va)
+            r_hat[mva] = r_hat_chunk
+            info["down_coefs"] = coefs.tolist()
+
+        # R11a (2 first-order terms) on everything else
+        mtr = fam_tr != DOWN
+        mva = fam_va != DOWN
+        if mtr.sum() > 0 and mva.sum() > 0:
+            feats_tr = np.stack([
+                np.ones(mtr.sum(), dtype=np.float64),
+                train["Xp_dW"].to(torch.float64).numpy()[mtr],
+                train["Wp_dX"].to(torch.float64).numpy()[mtr],
+            ], axis=1)
+            feats_va = np.stack([
+                np.ones(mva.sum(), dtype=np.float64),
+                val["Xp_dW"].to(torch.float64).numpy()[mva],
+                val["Wp_dX"].to(torch.float64).numpy()[mva],
+            ], axis=1)
+            y = train["r"].to(torch.float64).numpy()[mtr]
+            r_hat_chunk, coefs = _lsq_int_round(feats_tr, y, feats_va)
+            r_hat[mva] = r_hat_chunk
+            info["other_coefs"] = coefs.tolist()
+
+        return torch.from_numpy(r_hat), info
+    return fn
+
+
+def model_R11_fixed_unit_coefs():
+    """The proof-friendly version: r̂ = X'·δ_W + W'·δ_X - δ_X·δ_W (no LSQ).
+
+    The algebra GUARANTEES these are the right coefs modulo accumulator
+    drift and rounding. Skipping LSQ means no fitted parameters at all —
+    fully rule-based. Saves the proof from having to commit to learned
+    constants.
+    """
+    def fn(*, train, val):
+        if "Xp_dW" not in train:
+            raise RuntimeError("R11_fixed needs --compute-features")
+        r_hat_f = (val["Xp_dW"].to(torch.float64)
+                   + val["Wp_dX"].to(torch.float64)
+                   - val["dX_dW"].to(torch.float64))
+        r_hat = torch.round(r_hat_f).to(torch.int64)
+        return r_hat, {"rule": "X'·δ_W + W'·δ_X - δ_X·δ_W (no fit)"}
+    return fn
+
+
 def model_R9_outlier_aware():
     """r̂ uses clip counts + absmax features alongside Y' and scale."""
     def fn(*, train, val):
@@ -492,6 +939,11 @@ def main():
     ap.add_argument("--models", default="R1,R2,R3,R4,R5,R7,R7b",
                     help="comma-separated model names")
     ap.add_argument("--out", required=True, help="output json with results table")
+    ap.add_argument("--subsample-per-matmul-train", type=int, default=0,
+                    help="if >0, sample N cells per (matmul_id, prompt) for training only")
+    ap.add_argument("--subsample-per-matmul-val", type=int, default=0,
+                    help="if >0, sample N cells per (matmul_id, prompt) for val only")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -533,6 +985,18 @@ def main():
         "R10": model_R10_delta_summaries,
         "R10b": model_R10b_per_family_delta,
         "R11": model_R11_mixed_dotprods,
+        "R11a": model_R11a_first_order_only,
+        "R11b_X": model_R11b_only_XpdW,
+        "R11b_W": model_R11b_only_WpdX,
+        "R11_fixed": model_R11_fixed_unit_coefs,
+        "R11_hybrid_byK": model_R11_hybrid_byK,
+        "R13": model_R13_rank1,
+        "R13a_W": model_R13a_W_rank1_only,
+        "R14": model_R14_rank1_plus_WpdX,
+        "R11_per_family": model_R11_per_family,
+        "R12": model_R12_sign_quantized_delta,
+        "R12a_X": model_R12a_mixed_signXp_dW,
+        "R12a_W": model_R12a_mixed_Xp_signdW,
     }
     requested = [m.strip() for m in args.models.split(",") if m.strip()]
     results = []

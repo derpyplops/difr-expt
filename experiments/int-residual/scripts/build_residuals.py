@@ -229,10 +229,13 @@ def compute_features(
     }
 
 
-def build_one_prompt(rec_file: Path, out_file: Path, cast_mode: str,
-                     compute_full_features: bool, top_k: int = 4,
-                     B_OP: int = 9, intN_bits: int = 8) -> dict:
+def build_one_prompt(rec_file: Path, weights: dict, out_file: Path,
+                     cast_mode: str, compute_full_features: bool,
+                     top_k: int = 4, B_OP: int = 9, intN_bits: int = 8) -> dict:
     """Process all records in a prompt's .pt and emit a flat per-cell dataset.
+
+    `weights[name]` provides the shared W_q and s_W tensors (deduped across
+    prompts to keep on-disk size sane).
 
     Returns summary stats for printing.
     """
@@ -263,17 +266,26 @@ def build_one_prompt(rec_file: Path, out_file: Path, cast_mode: str,
         # achievable fit. We compute them only when --compute-features.
     }
     if compute_full_features:
-        for k in ("sum_pos", "sum_neg", "abs_sum", "topk_xw",
-                  "Xp_dW", "Wp_dX", "dX_dW"):
+        for k in ("Xp_dW", "Wp_dX", "dX_dW", "Xp_signdW", "signdX_Wp"):
+            out_chunks[k] = []
+    if compute_full_features == "deep":
+        for k in ("sum_pos", "sum_neg", "abs_sum", "topk_xw"):
             out_chunks[k] = []
 
     n_cells_total = 0
     for matmul_id, r in enumerate(records):
         X_q = r["X_q"]    # [T, K]  fp16
-        W_q = r["W_q"]    # [D, K]  fp16
         Y   = r["Y"]      # [T, D]  fp32
         s_X = r["s_X"]    # [T]
-        s_W = r["s_W"]    # [D]
+        # Shared weights, looked up by qualified name. Backwards-compatible
+        # with the old per-record format where W_q and s_W lived in the record.
+        if "W_q" in r and r["W_q"].numel() > 0:
+            W_q = r["W_q"]
+            s_W = r["s_W"]
+        else:
+            wmeta = weights[r["name"]]
+            W_q = wmeta["W_q"]
+            s_W = wmeta["s_W"]
         family = r["family"]
         block = r["block"]
         prompt = r["prompt"]
@@ -359,10 +371,11 @@ def build_one_prompt(rec_file: Path, out_file: Path, cast_mode: str,
                 bcast = src.to(torch.float32).unsqueeze(0).expand(T, D)
             out_chunks[key].append(bcast.reshape(-1).contiguous())
 
-        if compute_full_features:
+        if compute_full_features == "deep":
             feats = compute_features(X_prime, W_prime, top_k=top_k)
             for k, v in feats.items():
                 out_chunks[k].append(v.reshape(-1))
+        if compute_full_features:
             # Per-cell mixed dot products X'·δ_W, W'·δ_X, δ_X·δ_W
             # Each is a [T, K] · [D, K] -> [T, D] reduction. EXPENSIVE.
             Xp_f = X_prime.to(torch.float64)
@@ -370,7 +383,20 @@ def build_one_prompt(rec_file: Path, out_file: Path, cast_mode: str,
             Xp_dW = Xp_f @ delta_W.T   # [T, D]
             Wp_dX = delta_X @ Wp_f.T   # [T, D]
             dX_dW = delta_X @ delta_W.T  # [T, D]
-            for k, v in [("Xp_dW", Xp_dW), ("Wp_dX", Wp_dX), ("dX_dW", dX_dW)]:
+            # Cheap-1bit-δ variants: keep only the SIGN of δ. Per-cell
+            # dot product X' · sign(δ_W) is one extra Freivalds matmul
+            # over {-1, 0, +1} entries (1-bit per cell instead of float64).
+            sign_dW = torch.sign(delta_W)  # [D, K]  in {-1, 0, +1}
+            sign_dX = torch.sign(delta_X)
+            Xp_signdW = Xp_f @ sign_dW.T  # [T, D]
+            signdX_Wp = sign_dX @ Wp_f.T  # [T, D]
+            for k, v in [
+                ("Xp_dW", Xp_dW),
+                ("Wp_dX", Wp_dX),
+                ("dX_dW", dX_dW),
+                ("Xp_signdW", Xp_signdW),
+                ("signdX_Wp", signdX_Wp),
+            ]:
                 out_chunks[k].append(v.to(torch.float32).reshape(-1).contiguous())
 
         n_cells_total += T * D
@@ -411,9 +437,11 @@ def main():
                     choices=["tight", "int8", "int16", "int24"])
     ap.add_argument("--B-op", type=int, default=9,
                     help="bit shift for tight cast (default 9 = lossless on fp8e4m3)")
-    ap.add_argument("--compute-features", action="store_true",
-                    help="also compute per-cell sum_pos/sum_neg/abs_sum/topk_xw "
-                         "(expensive, but enables sign-split & outlier residual models)")
+    ap.add_argument("--compute-features", default="",
+                    choices=["", "algebra", "deep"],
+                    help="'algebra' = per-cell mixed dot products only "
+                         "(X'·δ_W, W'·δ_X, δ_X·δ_W, sign variants — required for R11/R12). "
+                         "'deep' = also sum_pos/sum_neg/topk_xw (legacy sign-split, slow)")
     ap.add_argument("--top-k", type=int, default=4)
     args = ap.parse_args()
 
@@ -425,12 +453,22 @@ def main():
     print(f"Found {len(files)} prompt files in {rec_dir}")
     print(f"Cast mode: {args.cast_mode}; features: {args.compute_features}")
 
+    # Load shared weights once.
+    weights_path = rec_dir / "weights.pt"
+    if weights_path.exists():
+        weights = torch.load(weights_path, map_location="cpu", weights_only=False)
+        print(f"  loaded {len(weights)} shared weight tensors from {weights_path.name}")
+    else:
+        weights = None
+        print("  no shared weights.pt; falling back to per-record W_q (old format)")
+
     summary = []
     t0 = time.time()
     for f in files:
         out_f = out_dir / f"residuals_{f.stem}.pt"
         s = build_one_prompt(
-            f, out_f, args.cast_mode, args.compute_features,
+            f, weights or {}, out_f, args.cast_mode,
+            args.compute_features or False,
             top_k=args.top_k, B_OP=args.B_op,
         )
         elapsed = time.time() - t0

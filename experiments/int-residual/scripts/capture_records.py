@@ -85,19 +85,22 @@ class CaptureRec:
     has_bias: bool
 
 
-def install_hooks(model: nn.Module) -> tuple[list[CaptureRec], list, dict]:
+def install_hooks(
+    model: nn.Module
+) -> tuple[list[CaptureRec], list, dict, dict]:
     """Wrap each LowPrecisionLinear with a forward that captures the record.
 
-    We monkey-patch the `forward` of every LowPrecisionLinear because torch
-    hooks don't expose the intermediate `x_q` (the post-quant input) cleanly.
-    The wrapped forward computes the same answer and additionally stashes the
-    record into the closure-captured `records` list.
+    Returns (records, handles, cur_prompt, weights_dict).
+
+    weights_dict[name] = {"W_q": fp16 [D, K], "s_W": fp32 [D], "has_bias": bool}
+    Saved once per model, NOT once per prompt — weights are constant across
+    prompts so storing per-record blows up disk by 100×.
     """
     records: list[CaptureRec] = []
     handles: list = []  # store (module, original_forward) for unwrap
-    name_lookup = {id(m): n for n, m in model.named_modules()}
 
     cur_prompt = {"idx": 0}
+    weights: dict[str, dict] = {}
 
     def make_wrapper(mod: LowPrecisionLinear, name: str):
         orig_forward = mod.forward
@@ -110,6 +113,15 @@ def install_hooks(model: nn.Module) -> tuple[list[CaptureRec], list, dict]:
         W_dq = mod.weight.detach().to(torch.float32)
         fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
         s_W = W_dq.abs().amax(dim=-1).clamp_min(1e-30) / fp8_max
+
+        # Stash weights in the dedicated dict.
+        weights[name] = {
+            "W_q": W_dq.to(torch.float16).cpu(),
+            "s_W": s_W.to(torch.float32).cpu(),
+            "has_bias": mod.bias is not None,
+            "family": fam,
+            "block": blk,
+        }
 
         def wrapped_forward(x: torch.Tensor) -> torch.Tensor:
             # Compute the per-token activation scale exactly the way
@@ -135,9 +147,7 @@ def install_hooks(model: nn.Module) -> tuple[list[CaptureRec], list, dict]:
             else:
                 Y = out
 
-            # We only capture during the first forward pass we hook on; the
-            # caller resets between prompts.
-            # Reshape inputs to flat 2D [T, K] and 2D [D, K]:
+            # Reshape inputs to flat 2D [T, K] and 2D [T, D]:
             x_q_2d = x_q.reshape(-1, x_q.shape[-1])
             Y_2d = Y.reshape(-1, Y.shape[-1])
             s_X_flat = s_X.reshape(-1)
@@ -148,10 +158,10 @@ def install_hooks(model: nn.Module) -> tuple[list[CaptureRec], list, dict]:
                 block=blk,
                 prompt=cur_prompt["idx"],
                 X_q=x_q_2d.detach().to(torch.float16).cpu(),
-                W_q=W_dq.to(torch.float16).cpu(),
+                W_q=torch.empty(0),       # placeholder — read from shared file
                 Y=Y_2d.detach().to(torch.float32).cpu(),
                 s_X=s_X_flat.detach().to(torch.float32).cpu(),
-                s_W=s_W.to(torch.float32).cpu(),
+                s_W=torch.empty(0),       # placeholder
                 has_bias=mod.bias is not None,
             )
             records.append(rec)
@@ -165,7 +175,7 @@ def install_hooks(model: nn.Module) -> tuple[list[CaptureRec], list, dict]:
         if isinstance(m, LowPrecisionLinear):
             make_wrapper(m, name)
 
-    return records, handles, cur_prompt
+    return records, handles, cur_prompt, weights
 
 
 def restore_forwards(handles: list) -> None:
@@ -242,7 +252,12 @@ def main():
     print(f"  patched {len(n)} Linears")
 
     print("Installing capture hooks...")
-    records, handles, cur_prompt = install_hooks(model)
+    records, handles, cur_prompt, weights = install_hooks(model)
+    # Save the shared weights once.
+    weights_path = out / "weights.pt"
+    torch.save(weights, weights_path)
+    print(f"  saved shared weights → {weights_path.name} "
+          f"({sum(v['W_q'].numel() * 2 for v in weights.values()) / 1e6:.1f} MB)")
 
     print(f"Loading {args.n_prompts} wikitext prompts @ max_len={args.max_len}...")
     prompts = load_wikitext_prompts(tokenizer, args.n_prompts, args.max_len)
@@ -279,10 +294,9 @@ def main():
                     "block": r.block,
                     "prompt": r.prompt,
                     "X_q": r.X_q,
-                    "W_q": r.W_q,
+                    # W_q, s_W intentionally omitted — load from weights.pt
                     "Y":   r.Y,
                     "s_X": r.s_X,
-                    "s_W": r.s_W,
                     "has_bias": r.has_bias,
                 } for r in kept
             ],
