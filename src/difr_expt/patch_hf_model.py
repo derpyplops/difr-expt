@@ -344,8 +344,16 @@ def _wrap_attention_forward(attn_module: nn.Module, cfg: IntOpsConfig):
         attn_output = attn_module.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # Bind as bound method (it won't be — we'll attach as a callable on the module)
-    attn_module.forward = new_forward
+    # Debug: if DIFR_NOOP_ATTN_WRAP=1, replace forward with a pure passthrough
+    # to the original. This lets us check whether forward-replacement itself
+    # introduces any cost vs. native attention.
+    import os
+    if os.environ.get("DIFR_NOOP_ATTN_WRAP", "0") == "1":
+        _orig = attn_module._orig_forward
+        attn_module.forward = lambda *args, **kwargs: _orig(*args, **kwargs)
+    else:
+        # Bind as bound method (it won't be — we'll attach as a callable on the module)
+        attn_module.forward = new_forward
 
 
 # ---------------------------------------------------------------------------

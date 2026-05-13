@@ -345,6 +345,10 @@ def _nr_reciprocal_int(
     return r  # float64, holding the reciprocal directly
 
 
+import os
+_PASSTHROUGH_SOFTMAX: bool = bool(int(os.environ.get("DIFR_PASSTHROUGH_SOFTMAX", "0")))
+
+
 def int_softmax(
     x: torch.Tensor,
     dim: int = -1,
@@ -354,7 +358,13 @@ def int_softmax(
     cache: Optional[dict] = None,
     true_int: bool = False,
     lut_override: Optional[torch.Tensor] = None,
+    interpolate: bool = True,
 ) -> torch.Tensor:
+    if _PASSTHROUGH_SOFTMAX and not true_int:
+        # Debug-only: run F.softmax in fp32 to isolate LUT cost from wrapper
+        # structure cost. Not ZK-friendly; for measurement only.
+        import torch.nn.functional as _F
+        return _F.softmax(x, dim=dim, dtype=torch.float32).to(x.dtype)
     """Integer-friendly softmax.
 
     Pipeline:
@@ -403,8 +413,22 @@ def int_softmax(
     y = y.clamp_min(x_min)
     # Index in LUT (0 corresponds to x_min, N-1 to 0).
     idx_f = (y - x_min) / step
-    idx = idx_f.round().long().clamp(0, lut_size - 1)
-    e = lut[idx]  # [..., n]
+    if interpolate and not true_int:
+        # Linear interpolation between adjacent LUT entries. ZK-friendly: the
+        # fractional part `frac` is a public scalar derived from the integer
+        # operand y_int = round(y / step); the two LUT entries are public
+        # constants; the multiply-add is one int mul + one int add.
+        # In float-land here, this reduces nearest-neighbor error
+        # O(step/2 · exp(x)) → O(step²/8 · exp(x)), which is ~1000x smaller at
+        # 4k LUT. See `interpolate=False` for the older nearest path.
+        idx_floor = idx_f.floor().long().clamp(0, lut_size - 2)
+        frac = (idx_f - idx_floor.float()).clamp(0.0, 1.0)
+        e0 = lut[idx_floor]
+        e1 = lut[idx_floor + 1]
+        e = e0 + (e1 - e0) * frac
+    else:
+        idx = idx_f.round().long().clamp(0, lut_size - 1)
+        e = lut[idx]  # [..., n]
 
     if true_int:
         # Literal-int execution: the LUT values are integers under a public

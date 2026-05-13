@@ -84,6 +84,10 @@ def main():
     ap.add_argument("--no-int-silu", action="store_true")
     ap.add_argument("--no-int-attn-matmul", action="store_true")
     ap.add_argument("--no-int-rope", action="store_true")
+    ap.add_argument("--activation-scheme", default="uniform",
+                    choices=["uniform", "fp8_e4m3", "block_fp8_e4m3"],
+                    help="Student activation quant grid: uniform int24 (default) or per-token fp8 e4m3 or per-128-block fp8 e4m3.")
+    ap.add_argument("--softmax-x-min", type=float, default=-16.0)
     ap.add_argument("--n-prompts", type=int, default=100)
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--out", required=True)
@@ -93,6 +97,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"loading {args.base_model} / teacher={args.teacher_id} on {device} dtype={args.dtype}")
 
+    use_trainable = args.activation_scheme in ("fp8_e4m3", "block_fp8_e4m3")
     teacher, student, ref = build_models(
         model_name=args.base_model,
         teacher_source="published",
@@ -106,10 +111,10 @@ def main():
         activation_bits=args.activation_bits,
         rmsnorm_bits=args.rmsnorm_bits,
         softmax_lut_size=args.softmax_lut_size,
-        softmax_x_min=-16.0,
+        softmax_x_min=args.softmax_x_min,
         silu_lut_size=args.silu_lut_size,
         attn_matmul_bits=args.attn_matmul_bits,
-        trainable_matmul_weights=False,
+        trainable_matmul_weights=use_trainable,
         int_embedding=args.int_embedding,
         embedding_bits=24,
         int_lm_head=False,
@@ -118,12 +123,21 @@ def main():
         patch_nonmatmul=False,  # we'll re-patch below with selective ops
         int_nonmatmul_bitexact=False,
     )
+    if args.activation_scheme in ("fp8_e4m3", "block_fp8_e4m3"):
+        from difr_expt.int_cast import IntLinear as _IL
+        n_set = 0
+        for m in student.modules():
+            if isinstance(m, _IL):
+                m.activation_scheme = args.activation_scheme
+                m.use_int_matmul_path = False
+                n_set += 1
+        print(f"  set activation_scheme={args.activation_scheme} on {n_set} IntLinears")
     if not args.no_patch_nonmatmul:
         from difr_expt.patch_hf_model import IntOpsConfig as _Cfg, patch_model_int_nonmatmul as _patch
         ops_cfg = _Cfg(
             rmsnorm_bits=args.rmsnorm_bits,
             softmax_lut_size=args.softmax_lut_size,
-            softmax_x_min=-16.0,
+            softmax_x_min=args.softmax_x_min,
             silu_lut_size=args.silu_lut_size,
             attn_matmul_bits=args.attn_matmul_bits,
             replace_rmsnorm=not args.no_int_rmsnorm,
