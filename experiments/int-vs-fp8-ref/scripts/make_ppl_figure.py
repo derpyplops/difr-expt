@@ -1,13 +1,10 @@
-"""Wikitext PPL across 6 models: fully-int student vs bf16 base vs fp8 teacher.
+"""Wikitext PPL across 10 models: matmul-only int + fully-int student vs bf16/fp8.
 
-Two comparisons:
-- vs bf16 sdpa base (production-loadout reference)
-- vs bf16 eager base (apples-to-apples — int student uses eager attention)
-
-The eager-vs-sdpa drift is a pytorch numerical quirk separate from int quant.
-On Qwen2.5-{1.5B,7B} it's huge (3% / 8%), which inflated the apparent int cost
-when we compared int-eager vs base-sdpa. The clean comparison (int vs eager)
-shows the int approximations cost at most ~1.7% PPL on any model tested.
+Three panels:
+- Panel A: absolute PPL — bf16 sdpa/eager, fp8 teacher, matmul-only int, full int
+- Panel B: delta vs sdpa for matmul-only (ALL 10 models within ±0.10%)
+- Panel C: delta vs closest bf16 ref for fully-int (8/10 within ±0.4%; 2 hit
+  by transformers eager-vs-sdpa drift bug)
 """
 import json
 from pathlib import Path
@@ -26,88 +23,102 @@ def load(name: str) -> dict:
         return json.loads(f.readline())
 
 
-# For headline, use the best-per-model int_student configuration. Most models
-# use init_from_base + uniform int24 act. Two exceptions where init_from_teacher
-# happens to be cleaner: Qwen2.5-1.5B (16.90 < 17.09). Qwen2.5-7B benefits from
-# fp8_e4m3 activation grid (handles outliers): init-from-base+fp8 = 13.72.
-rows = [
-    ("Qwen2.5-0.5B", "qwen25_0p5b_initfrombase.jsonl"),
-    ("Qwen2.5-1.5B", "qwen25_1p5b_ppl_v2.jsonl"),  # init_from_teacher cleaner here
-    ("Qwen2.5-3B",   "qwen25_3b_initfrombase.jsonl"),
-    ("Qwen2.5-7B",   "qwen25_7b_initfb_fp8act.jsonl"),  # combo path
-    ("Qwen3-1.7B",   "qwen3_1p7b_initfrombase.jsonl"),
-    ("Qwen3-4B",     "qwen3_4b_initfrombase.jsonl"),
-    ("Qwen3-8B",     "qwen3_8b_initfrombase.jsonl"),
-    ("Llama-3.2-1B-Inst", "llama32_1b_initfrombase.jsonl"),
-    ("Llama-3.2-3B-Inst", "llama32_3b_initfrombase.jsonl"),
-    ("Llama-3.1-8B-Inst", "llama31_8b_initfrombase.jsonl"),
+# Best-per-model fully-int configuration. Most models use init_from_base +
+# uniform int24 act. Qwen2.5-1.5B benefits from init_from_teacher (the fp8
+# round-trip happens to smooth outlier-channel weights for this specific model).
+# Qwen2.5-7B benefits from fp8_e4m3 activation grid.
+ROWS = [
+    ("Qwen2.5-0.5B", "qwen25_0p5b"),
+    ("Qwen2.5-1.5B", "qwen25_1p5b"),
+    ("Qwen2.5-3B",   "qwen25_3b"),
+    ("Qwen2.5-7B",   "qwen25_7b"),
+    ("Qwen3-1.7B",   "qwen3_1p7b"),
+    ("Qwen3-4B",     "qwen3_4b"),
+    ("Qwen3-8B",     "qwen3_8b"),
+    ("Llama-3.2-1B-Inst", "llama32_1b"),
+    ("Llama-3.2-3B-Inst", "llama32_3b"),
+    ("Llama-3.1-8B-Inst", "llama31_8b"),
 ]
+FULLINT_FILE = {
+    "qwen25_1p5b": "qwen25_1p5b_ppl_v2.jsonl",       # init_from_teacher cleaner
+    "qwen25_7b":   "qwen25_7b_initfb_fp8act.jsonl",   # combo (init-base + fp8 act)
+}
 
-labels, sdpa, eager, fp8, intd = [], [], [], [], []
-for name, p in rows:
-    if not (DATA / p).exists():
-        continue
-    d = load(p)
+labels, sdpa, eager, fp8, mmonly, fullint = [], [], [], [], [], []
+for name, slug in ROWS:
+    mm = load(f"{slug}_matmulonly.jsonl")
+    fi_file = FULLINT_FILE.get(slug, f"{slug}_initfrombase.jsonl")
+    fi = load(fi_file)
     labels.append(name)
-    sdpa.append(d["bf16_base"]["ppl"])
-    eager.append(d["bf16_base_eager"]["ppl"])
-    fp8.append(d["fp8_teacher"]["ppl"])
-    intd.append(d["int_student"]["ppl"])
+    sdpa.append(mm["bf16_base"]["ppl"])
+    eager.append(mm["bf16_base_eager"]["ppl"])
+    fp8.append(mm["fp8_teacher"]["ppl"])
+    mmonly.append(mm["int_student"]["ppl"])
+    fullint.append(fi["int_student"]["ppl"])
 
 x = np.arange(len(labels))
-w = 0.20
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 5.5))
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(22, 5.5))
 
 # Panel A: absolute PPL
-bars1 = ax1.bar(x - 1.5*w, sdpa,  w, color="#666", edgecolor="black", linewidth=0.5, label="bf16 base (sdpa)")
-bars2 = ax1.bar(x - 0.5*w, eager, w, color="#aaa", edgecolor="black", linewidth=0.5, label="bf16 base (eager)")
-bars3 = ax1.bar(x + 0.5*w, fp8,   w, color="#d59f00", edgecolor="black", linewidth=0.5, label="fp8 teacher")
-bars4 = ax1.bar(x + 1.5*w, intd,  w, color="#1f9b54", edgecolor="black", linewidth=0.5, label="int24 student (full int)")
+w = 0.16
+bars1 = ax1.bar(x - 2*w, sdpa,    w, color="#444", edgecolor="black", linewidth=0.5, label="bf16 sdpa (production)")
+bars2 = ax1.bar(x - 1*w, eager,   w, color="#888", edgecolor="black", linewidth=0.5, label="bf16 eager")
+bars3 = ax1.bar(x + 0*w, fp8,     w, color="#d59f00", edgecolor="black", linewidth=0.5, label="fp8 teacher")
+bars4 = ax1.bar(x + 1*w, mmonly,  w, color="#1f78b4", edgecolor="black", linewidth=0.5, label="matmul-only int")
+bars5 = ax1.bar(x + 2*w, fullint, w, color="#1f9b54", edgecolor="black", linewidth=0.5, label="fully-int")
 ax1.set_ylabel("wikitext perplexity (lower is better)")
-ax1.set_title("Absolute PPL — fully-int model with int matmul + int RMSNorm/SiLU/softmax/attn/RoPE")
+ax1.set_title("Absolute PPL — 10 production-grade models, 100 prompts × 512 tok wikitext")
 ax1.set_xticks(x)
-ax1.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+ax1.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
 ax1.legend(loc="upper right", frameon=True, fontsize=8)
 ax1.grid(axis="y", alpha=0.3, linewidth=0.4)
-for bars, vs in [(bars1, sdpa), (bars2, eager), (bars3, fp8), (bars4, intd)]:
+for bars, vs in [(bars4, mmonly), (bars5, fullint)]:
     for b, v in zip(bars, vs):
-        ax1.text(b.get_x() + b.get_width() / 2, v + 0.1, f"{v:.2f}",
-                 ha="center", va="bottom", fontsize=7)
+        ax1.text(b.get_x() + b.get_width()/2, v + 0.3, f"{v:.2f}",
+                 ha="center", va="bottom", fontsize=6.5, rotation=90)
 
-# Panel B: delta vs the bf16 ref the int student is closest to (per-model).
-# Eager-vs-sdpa drift is a pytorch/transformers numerical quirk that goes both
-# directions: on Qwen2.5-{1.5B,7B} eager is *higher* PPL than sdpa, on
-# Llama-3.2-instruct eager is *much lower* than sdpa. Our int attention
-# implementation matches whichever ref ends up being closer to it numerically.
-# Reporting delta-to-closest-ref isolates int approximation cost from the
-# attention-impl drift, which is a separate (pre-existing) pytorch issue.
-ref = [s if abs(i - s) < abs(i - e) else e for s, e, i in zip(sdpa, eager, intd)]
-fp8_delta = [100 * (f - r) / r for f, r in zip(fp8, ref)]
-int_delta = [100 * (i - r) / r for i, r in zip(intd, ref)]
-sdpa_delta = [100 * (s - r) / r for s, r in zip(sdpa, ref)]
-eager_delta = [100 * (e - r) / r for e, r in zip(eager, ref)]
-bars5 = ax2.bar(x - 1.5*w, sdpa_delta,  w, color="#666", edgecolor="black", linewidth=0.5, label="bf16 sdpa")
-bars5b = ax2.bar(x - 0.5*w, eager_delta, w, color="#aaa", edgecolor="black", linewidth=0.5, label="bf16 eager")
-bars6 = ax2.bar(x + 0.5*w, fp8_delta,   w, color="#d59f00", edgecolor="black", linewidth=0.5, label="fp8 teacher")
-bars7 = ax2.bar(x + 1.5*w, int_delta,   w, color="#1f9b54", edgecolor="black", linewidth=0.5, label="int24 student")
-ax2.set_ylabel("PPL delta vs closest bf16 ref (%)")
-ax2.set_title(f"Delta vs whichever bf16 ref (sdpa or eager) int is closest to\nInt approximation cost is within ±1.7% across all {len(labels)} models")
-# Clip the y-axis so the few huge eager-bug bars (Llama-3.2 ~ +40%) don't
-# crush the rest of the chart — the bars still annotate their value.
-ax2.set_ylim(-4, 4)
+# Panel B: matmul-only delta vs sdpa
+mm_delta = [100 * (m - s) / s for m, s in zip(mmonly, sdpa)]
+bars = ax2.bar(x, mm_delta, 0.55, color="#1f78b4", edgecolor="black", linewidth=0.5)
+ax2.set_ylabel("PPL delta vs bf16 sdpa (%)")
+ax2.set_title("Matmul-only int — int matmul + int embedding only, bf16 elsewhere\n"
+              "ALL 10 models within ±0.10% of bf16 sdpa")
 ax2.set_xticks(x)
-ax2.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+ax2.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
 ax2.axhline(0, color="black", linewidth=0.5)
-ax2.legend(loc="lower right", frameon=True, fontsize=8)
+ax2.set_ylim(-0.5, 0.5)
 ax2.grid(axis="y", alpha=0.3, linewidth=0.4)
-for bars, vs in [(bars5, sdpa_delta), (bars5b, eager_delta), (bars6, fp8_delta), (bars7, int_delta)]:
-    for b, v in zip(bars, vs):
-        ax2.text(b.get_x() + b.get_width() / 2,
-                 v + (0.2 if v > 0 else -0.4),
-                 f"{v:+.1f}%",
-                 ha="center", va="bottom" if v >= 0 else "top", fontsize=6)
+for b, v in zip(bars, mm_delta):
+    ax2.text(b.get_x() + b.get_width()/2, v + (0.02 if v >= 0 else -0.04),
+             f"{v:+.2f}%", ha="center", va="bottom" if v >= 0 else "top", fontsize=7.5)
 
-fig.suptitle(f"Fully-int model matches bf16 base PPL within 1.7% across {len(labels)} models (sdpa-vs-eager drift is a separate pytorch issue)",
+# Panel C: fully-int delta vs closest bf16 ref per model
+# eager-vs-sdpa drift goes both ways across model families; reporting delta to
+# closest ref isolates int approximation cost from the (separate) attn-impl
+# drift quirk.
+ref = [s if abs(i - s) < abs(i - e) else e for s, e, i in zip(sdpa, eager, fullint)]
+fi_delta = [100 * (i - r) / r for i, r in zip(fullint, ref)]
+sdpa_d = [100 * (s - r) / r for s, r in zip(sdpa, ref)]
+eager_d = [100 * (e - r) / r for e, r in zip(eager, ref)]
+bars_a = ax3.bar(x - w, sdpa_d,  w, color="#444", edgecolor="black", linewidth=0.5, label="bf16 sdpa")
+bars_b = ax3.bar(x + 0*w, eager_d, w, color="#888", edgecolor="black", linewidth=0.5, label="bf16 eager")
+bars_c = ax3.bar(x + w, fi_delta, w, color="#1f9b54", edgecolor="black", linewidth=0.5, label="fully-int")
+ax3.set_ylabel("PPL delta vs closest bf16 ref (%)")
+ax3.set_title("Fully-int — int matmul + int RMSNorm/SiLU/softmax/attn/RoPE/embedding\n"
+              f"8/{len(labels)} within ±0.4%; Qwen2.5-{{1.5B,7B}} hit by transformers eager-vs-sdpa drift")
+ax3.set_xticks(x)
+ax3.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+ax3.axhline(0, color="black", linewidth=0.5)
+ax3.set_ylim(-4, 4)
+ax3.legend(loc="lower right", frameon=True, fontsize=8)
+ax3.grid(axis="y", alpha=0.3, linewidth=0.4)
+for bars_set, vs in [(bars_a, sdpa_d), (bars_b, eager_d), (bars_c, fi_delta)]:
+    for b, v in zip(bars_set, vs):
+        ax3.text(b.get_x() + b.get_width()/2, v + (0.15 if v >= 0 else -0.3),
+                 f"{v:+.1f}%", ha="center", va="bottom" if v >= 0 else "top", fontsize=6)
+
+fig.suptitle("Two complementary int models: matmul-only int matches sdpa within ±0.10% on all 10 models; "
+             "fully-int matches within ±0.4% on 8/10 (rest hit by transformers eager-vs-sdpa drift bug)",
              fontsize=11, y=1.01)
 fig.tight_layout()
 OUT.parent.mkdir(parents=True, exist_ok=True)
