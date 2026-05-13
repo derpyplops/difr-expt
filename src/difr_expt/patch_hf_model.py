@@ -401,13 +401,15 @@ def patch_model_int_nonmatmul(
 
     counts = {"rmsnorm": 0, "silu": 0, "attention": 0}
 
-    # 1) Force eager attention everywhere (so our forward override fires the
-    # right code path)
-    if hasattr(model, "config"):
-        model.config._attn_implementation = "eager"
-        # propagate to text/vision sub-configs that might exist
-        if hasattr(model.config, "text_config"):
-            model.config.text_config._attn_implementation = "eager"
+    # 1) Force eager attention ONLY if we're actually wrapping the attention
+    # forward (softmax / attn_matmul replacement). Otherwise leave the default
+    # (sdpa) — on some models (e.g. Qwen2.5-7B), the eager-vs-sdpa numerical
+    # drift compounds to ~10% PPL even when no other op is replaced.
+    if cfg.replace_softmax or cfg.replace_attn_matmul:
+        if hasattr(model, "config"):
+            model.config._attn_implementation = "eager"
+            if hasattr(model.config, "text_config"):
+                model.config.text_config._attn_implementation = "eager"
 
     # 2) Walk and patch
     if cfg.replace_rmsnorm:

@@ -79,6 +79,11 @@ def main():
     ap.add_argument("--silu-lut-size", type=int, default=4096)
     ap.add_argument("--int-embedding", action="store_true")
     ap.add_argument("--no-patch-nonmatmul", action="store_true")
+    ap.add_argument("--no-int-rmsnorm", action="store_true")
+    ap.add_argument("--no-int-softmax", action="store_true")
+    ap.add_argument("--no-int-silu", action="store_true")
+    ap.add_argument("--no-int-attn-matmul", action="store_true")
+    ap.add_argument("--no-int-rope", action="store_true")
     ap.add_argument("--n-prompts", type=int, default=100)
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--out", required=True)
@@ -110,16 +115,41 @@ def main():
         int_lm_head=False,
         init_from_teacher=True,
         keep_fp32_ref=True,
-        patch_nonmatmul=not args.no_patch_nonmatmul,
+        patch_nonmatmul=False,  # we'll re-patch below with selective ops
         int_nonmatmul_bitexact=False,
     )
+    if not args.no_patch_nonmatmul:
+        from difr_expt.patch_hf_model import IntOpsConfig as _Cfg, patch_model_int_nonmatmul as _patch
+        ops_cfg = _Cfg(
+            rmsnorm_bits=args.rmsnorm_bits,
+            softmax_lut_size=args.softmax_lut_size,
+            softmax_x_min=-16.0,
+            silu_lut_size=args.silu_lut_size,
+            attn_matmul_bits=args.attn_matmul_bits,
+            replace_rmsnorm=not args.no_int_rmsnorm,
+            replace_softmax=not args.no_int_softmax,
+            replace_silu=not args.no_int_silu,
+            replace_attn_matmul=not args.no_int_attn_matmul,
+            replace_rope=not args.no_int_rope,
+        )
+        counts = _patch(student, ops_cfg)
+        print(f"  int non-matmul counts: {counts} (ablations: "
+              f"no_rms={args.no_int_rmsnorm} no_sm={args.no_int_softmax} "
+              f"no_silu={args.no_int_silu} no_attn={args.no_int_attn_matmul} no_rope={args.no_int_rope})")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     prompts = load_wikitext_prompts(tokenizer, args.n_prompts, args.max_len)
     print(f"loaded {len(prompts)} prompts")
 
+    # Reference with eager attention (apples-to-apples vs int_student which
+    # forces eager when attention ops are wrapped). For Qwen2.5 some sizes,
+    # eager-vs-sdpa drift is huge (8% on 7B), so this matters.
+    from transformers import AutoModelForCausalLM as _ACL
+    print("[loading] bf16 base with eager attention for apples-to-apples comparison")
+    ref_eager = _ACL.from_pretrained(args.base_model, dtype=dtype, attn_implementation="eager").to(device).eval()
+
     results = {}
-    for name, m in (("bf16_base", ref), ("fp8_teacher", teacher), ("int_student", student)):
+    for name, m in (("bf16_base", ref), ("bf16_base_eager", ref_eager), ("fp8_teacher", teacher), ("int_student", student)):
         t0 = time.time()
         ppl, n_tokens = model_ppl(m, prompts, device)
         wall = time.time() - t0
