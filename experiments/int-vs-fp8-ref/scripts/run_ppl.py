@@ -88,6 +88,9 @@ def main():
                     choices=["uniform", "fp8_e4m3", "block_fp8_e4m3"],
                     help="Student activation quant grid: uniform int24 (default) or per-token fp8 e4m3 or per-128-block fp8 e4m3.")
     ap.add_argument("--softmax-x-min", type=float, default=-16.0)
+    ap.add_argument("--init-from-base", action="store_true",
+                    help="Build IntLinear weights from the bf16 base model directly "
+                         "(no teacher fp8 round-trip). Default initializes from fp8 teacher.")
     ap.add_argument("--n-prompts", type=int, default=100)
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--out", required=True)
@@ -118,7 +121,7 @@ def main():
         int_embedding=args.int_embedding,
         embedding_bits=24,
         int_lm_head=False,
-        init_from_teacher=True,
+        init_from_teacher=not args.init_from_base,
         keep_fp32_ref=True,
         patch_nonmatmul=False,  # we'll re-patch below with selective ops
         int_nonmatmul_bitexact=False,

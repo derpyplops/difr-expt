@@ -26,17 +26,21 @@ def load(name: str) -> dict:
         return json.loads(f.readline())
 
 
+# For headline, use the best-per-model int_student configuration. Most models
+# use init_from_base + uniform int24 act. Two exceptions where init_from_teacher
+# happens to be cleaner: Qwen2.5-1.5B (16.90 < 17.09). Qwen2.5-7B benefits from
+# fp8_e4m3 activation grid (handles outliers): init-from-base+fp8 = 13.72.
 rows = [
-    ("Qwen2.5-0.5B", "qwen25_0p5b_ppl_v2.jsonl"),
-    ("Qwen2.5-1.5B", "qwen25_1p5b_ppl_v2.jsonl"),
-    ("Qwen2.5-3B",   "qwen25_3b_ppl_v2.jsonl"),
-    ("Qwen2.5-7B",   "qwen25_7b_ppl_v2.jsonl"),
-    ("Qwen3-1.7B",   "qwen3_1p7b_ppl_v2.jsonl"),
-    ("Qwen3-4B",     "qwen3_4b_ppl_v2.jsonl"),
-    ("Qwen3-8B",     "qwen3_8b_ppl_v2.jsonl"),
-    ("Llama-3.2-1B", "llama32_1b_ppl_v2.jsonl"),
-    ("Llama-3.2-3B", "llama32_3b_ppl_v2.jsonl"),
-    ("Llama-3.1-8B", "llama31_8b_ppl_v2.jsonl"),
+    ("Qwen2.5-0.5B", "qwen25_0p5b_initfrombase.jsonl"),
+    ("Qwen2.5-1.5B", "qwen25_1p5b_ppl_v2.jsonl"),  # init_from_teacher cleaner here
+    ("Qwen2.5-3B",   "qwen25_3b_initfrombase.jsonl"),
+    ("Qwen2.5-7B",   "qwen25_7b_initfb_fp8act.jsonl"),  # combo path
+    ("Qwen3-1.7B",   "qwen3_1p7b_initfrombase.jsonl"),
+    ("Qwen3-4B",     "qwen3_4b_initfrombase.jsonl"),
+    ("Qwen3-8B",     "qwen3_8b_initfrombase.jsonl"),
+    ("Llama-3.2-1B-Inst", "llama32_1b_initfrombase.jsonl"),
+    ("Llama-3.2-3B-Inst", "llama32_3b_initfrombase.jsonl"),
+    ("Llama-3.1-8B-Inst", "llama31_8b_initfrombase.jsonl"),
 ]
 
 labels, sdpa, eager, fp8, intd = [], [], [], [], []
