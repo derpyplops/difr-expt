@@ -12,14 +12,24 @@ Prior work in this repo measures end-to-end logit divergence
 gives a layer-by-layer view of where the int-cast error originates and
 how it compounds through the network.
 
+**Scope (2026-05-15 onward): real hardware FP8 only.** The fake-quant
+emulation modes were removed after we confirmed that emulation
+substantially underestimates the deployed quantization error
+(emulated 16-bit-int: top-1 = 1.0; real FP8: top-1 ≈ 0.91 on the
+same checkpoint family). The harness now requires a Hopper-class
+GPU (SM_89+) and refuses to run otherwise — `ScaledMmProbe` aborts
+the run if `torch._scaled_mm` is never called during the first
+forward.
+
 ## What the harness does
 
 For one prompt:
 
-1. Load the model twice: `M_float` (untouched bf16/fp32 teacher) and
-   `M_int` (full int student — `patch_model_int_cast` for Linears +
-   `patch_model_int_nonmatmul` for RMSNorm / softmax / SiLU / attn-matmul
-   / RoPE).
+1. Load the model twice: `M_float` (untouched bf16 teacher) and
+   `M_int` (a real-FP8 student loaded from a pre-quantized checkpoint
+   via HF + compressed_tensors, with the lazy-decompress hook
+   stripped and every FP8 nn.Linear swapped to an `FP8Linear` that
+   dispatches through `torch._scaled_mm`).
 2. Register kwarg-aware forward hooks on **every named submodule** of
    both models. Hooks capture `(args, kwargs, output)` keyed by qualified
    name.

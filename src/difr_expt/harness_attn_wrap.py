@@ -1,67 +1,48 @@
-"""Float-side attention wrapper + name normalization for the per-layer L2 harness.
+"""Float-side attention wrapper for the per-layer L2 harness.
 
 Problem this solves
 -------------------
-The int patcher (`patch_model_int_nonmatmul`) hides three integerized ops
-inside the attention forward closure:
+HF's attention runs Q@K.T, softmax, and P@V as inline tensor ops, not
+as `nn.Module`s — so the harness's by-name hook matching can't see them
+on the float (bf16) side. The FP8 student loaded via compressed_tensors
+also runs those three ops inline (only `nn.Linear` gets quantized in
+FP8-dynamic). To get a matching submodule on *both* sides so the
+harness can diff them, we replace each attention's forward with a
+float-eager wrapper that routes torch.matmul / F.softmax through
+`FloatMatmul` / `FloatSoftmax` `nn.Module` wrappers — exposing
+`_qk_matmul`, `_pv_matmul`, `_softmax` as hookable submodules.
 
-  - Q @ K.T   →  IntMatmul attached as `attn._int_qk_matmul`
-  - softmax  →  IntSoftmaxModule attached as `attn._int_softmax`
-  - P @ V   →  IntMatmul attached as `attn._int_pv_matmul`
-
-These are nn.Modules and therefore individually hookable. But HF's stock
-float attention runs the same ops inline (`torch.matmul`, `F.softmax`,
-`torch.matmul` — no modules), so the harness's by-name hook matching
-finds no float-side counterpart to diff against. Result: the harness
-silently skips three of the most interesting ops.
-
-What this module does
----------------------
-1. `wrap_attention_forward_float(attn)` — replaces the float attention's
-   forward with a closure that uses `FloatMatmul` / `FloatSoftmax` modules
-   instead of inline `torch.matmul` / `F.softmax`. Math is bit-identical
-   to HF's `eager_attention_forward` (we verified the source in
-   transformers 4.57.3). Exposes `_qk_matmul`, `_pv_matmul`, `_softmax`
-   on the attention module.
-
-2. `rename_int_attn_submodules(model)` — renames the int patcher's
-   `_int_qk_matmul / _int_pv_matmul / _int_softmax` to the canonical
-   names `_qk_matmul / _pv_matmul / _softmax`, matching the float side.
-   The int patcher's `new_forward` captures these modules in a closure
-   (not via attribute access), so renaming the attribute leaves runtime
-   behavior unchanged.
-
-3. `prepare_models_for_harness(float_model, int_cfg)` — applies (1) to
-   the float model, builds the int student (`patch_model_int_nonmatmul`
-   + `patch_model_int_cast`), and applies (2). Forces eager attention
-   dispatch on both (the wrappers parse the eager additive-mask format,
-   not the sdpa bool-mask format).
-
-RoPE caveat
------------
-The int patcher attaches an `IntRopeApply` module as `attn._int_rope`
-but never invokes it — its `new_forward` calls the float
-`apply_rotary_pos_emb` directly. So RoPE is currently not integerized
-in this codebase and there is no per-op error to measure for it. The
-harness reflects that: no `_rope` submodule is exposed.
+Numerics are bit-identical to HF's `eager_attention_forward` in
+transformers 4.57.3 (we verified the source). The only change is
+routing the same calls through `nn.Module`s.
 """
 
 from __future__ import annotations
 
-import copy
 from importlib import import_module
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from difr_expt.patch_hf_model import (
-    ATTENTION_CLASS_NAMES,
-    IntOpsConfig,
-    _repeat_kv,
-    patch_model_int_nonmatmul,
-)
-from difr_expt.int_cast import patch_model_int_cast
+
+# Class names we treat as transformer attention modules.
+ATTENTION_CLASS_NAMES = {
+    "LlamaAttention",
+    "Qwen2Attention",
+    "Qwen3Attention",
+    "MistralAttention",
+}
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """HF's repeat_kv re-implementation (kept local so this module doesn't
+    depend on the fake-quant int patcher)."""
+    batch, n_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, n_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, n_kv_heads * n_rep, slen, head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -228,31 +209,6 @@ def wrap_all_attention_forwards_float(model: nn.Module) -> int:
     return n
 
 
-def rename_int_attn_submodules(model: nn.Module) -> int:
-    """Rename `_int_qk_matmul → _qk_matmul`, `_int_pv_matmul → _pv_matmul`,
-    `_int_softmax → _softmax` on every int-patched attention so the names
-    match the float wrapper's canonical names.
-
-    The int patcher's `new_forward` captures the matmul/softmax modules
-    as local closure variables, so this rename does not affect runtime.
-    Returns the number of attention modules touched.
-    """
-    n = 0
-    for _name, m in model.named_modules():
-        if m.__class__.__name__ not in ATTENTION_CLASS_NAMES:
-            continue
-        for src_attr, dst_attr in [
-            ("_int_qk_matmul", "_qk_matmul"),
-            ("_int_pv_matmul", "_pv_matmul"),
-            ("_int_softmax", "_softmax"),
-        ]:
-            if hasattr(m, src_attr):
-                setattr(m, dst_attr, getattr(m, src_attr))
-                delattr(m, src_attr)
-        n += 1
-    return n
-
-
 def force_eager_attn(model: nn.Module) -> None:
     """Force eager attention dispatch on the model config. Our wrappers
     interpret the eager additive-mask format; under sdpa, HF would pass a
@@ -267,49 +223,3 @@ def force_eager_attn(model: nn.Module) -> None:
             model.config.text_config._attn_implementation = "eager"
 
 
-def prepare_models_for_harness(
-    float_model: nn.Module,
-    ops_cfg: IntOpsConfig,
-    weight_bits: int = 16,
-    activation_bits: int = 16,
-    include_lm_head: bool = True,
-) -> tuple[nn.Module, nn.Module]:
-    """Prep one float teacher and one full-int student for the harness with
-    matching submodule names across the attention sub-ops.
-
-    Steps:
-      1. Force eager attention on the float model (config-level).
-      2. Deepcopy the float model into `int_model` before wrapping (so
-         the int model's class structure is the un-wrapped original;
-         the int patcher's own attention wrapper will run on it).
-      3. Wrap the float model's attentions with the float-eager wrapper
-         (exposes `_qk_matmul`, `_pv_matmul`, `_softmax`).
-      4. Patch the int model with `patch_model_int_nonmatmul` (replaces
-         RMSNorm / SiLU and installs the int attention closure) and
-         `patch_model_int_cast` (every Linear → IntLinear).
-      5. Rename `_int_*` → `_*` on int side so names match float side.
-
-    Returns (float_model, int_model). Caller is responsible for `.to(device)`
-    and `.eval()` after this returns.
-    """
-    force_eager_attn(float_model)
-
-    # Deepcopy BEFORE wrapping the float model. If we wrapped first and
-    # then deepcopied, the int patcher's _wrap_attention_forward would
-    # build a new IntMatmul/IntSoftmax stack on top of our float wrapper,
-    # double-replacing forward and producing nonsense.
-    int_model = copy.deepcopy(float_model).eval()
-    for p in int_model.parameters():
-        p.requires_grad = False
-
-    wrap_all_attention_forwards_float(float_model)
-
-    patch_model_int_nonmatmul(int_model, ops_cfg)
-    patch_model_int_cast(
-        int_model,
-        weight_bits=weight_bits,
-        activation_bits=activation_bits,
-        include_lm_head=include_lm_head,
-    )
-    rename_int_attn_submodules(int_model)
-    return float_model, int_model

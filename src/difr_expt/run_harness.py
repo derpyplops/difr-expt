@@ -1,7 +1,10 @@
-"""Per-named-module L2 error harness.
+"""Per-named-module L2 error harness — real hardware FP8 only.
 
-Runs a float teacher and a full-int student on the same prompts and reports
-the L2 divergence at every named submodule. Two flavors per module:
+Runs a bf16 teacher and a real-FP8 student (loaded from a pre-quantized
+checkpoint via HF + compressed_tensors, with weights kept in
+`torch.float8_e4m3fn` and matmuls dispatching through
+`torch._scaled_mm` on Hopper) and reports L2 divergence at every named
+submodule. Two flavors per module:
 
   - **propagated** = ||int.output[m] − float.output[m]||₂
         Compounded error: how off is the int model's value at m when it has
@@ -15,15 +18,16 @@ the L2 divergence at every named submodule. Two flavors per module:
 Final per-token logit metrics (L2, KL, top-1, top-5) are emitted too — the
 ground-truth target Luke called out.
 
-The int student is built by composing the two existing patchers:
-  - `patch_model_int_cast`        — every nn.Linear → IntLinear
-  - `patch_model_int_nonmatmul`   — RMSNorm / softmax / SiLU / attn-matmul
-                                    / RoPE → int approximations
+The fake-quant emulation modes have been removed: this harness exercises
+the real FP8 GEMM and refuses to run otherwise (see `ScaledMmProbe`).
+Requires a Hopper-class (SM_89+) GPU.
 
 CLI:
     python -m difr_expt.run_harness \\
-        --model Qwen/Qwen2.5-0.5B --n-prompts 2 --max-len 64 \\
-        --dtype float32 --device cpu \\
+        --model Qwen/Qwen2.5-0.5B \\
+        --student-model RedHatAI/Qwen2.5-0.5B-FP8-dynamic \\
+        --dtype bfloat16 --device cuda \\
+        --n-prompts 16 --max-len 256 \\
         --out experiments/layer-harness/reports/results-$(date +%F).json
 
 The .json gets a sister .md table next to it.
@@ -32,20 +36,20 @@ The .json gets a sister .md table next to it.
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from difr_expt.harness_attn_wrap import prepare_models_for_harness
-from difr_expt.patch_hf_model import IntOpsConfig
+from difr_expt.harness_attn_wrap import (
+    force_eager_attn,
+    wrap_all_attention_forwards_float,
+)
 from difr_expt.metrics import (
     kl_div_ref_to_cand,
     logit_l2,
@@ -512,38 +516,17 @@ def render_table(rows: list[dict], logit_metrics: dict[str, float], header: dict
 @dataclass
 class HarnessConfig:
     model: str = "Qwen/Qwen2.5-0.5B"
-    dtype: str = "float32"
+    student_model: str = ""  # required: HF id of a pre-quantized FP8 checkpoint
+    dtype: str = "bfloat16"
     device: str = "auto"
-    n_prompts: int = 2
-    max_len: int = 64
+    n_prompts: int = 16
+    max_len: int = 256
     seed: int = 42
-    # Int-cast knobs
-    weight_bits: int = 16
-    activation_bits: int = 16
-    include_lm_head: bool = True
-    int_embedding: bool = False
-    embedding_bits: int = 24
-    # IntOpsConfig knobs
-    rmsnorm_bits: int = 24
-    rmsnorm_nr_iter: int = 2
-    softmax_lut_size: int = 1024
-    softmax_x_min: float = -16.0
-    silu_lut_size: int = 4096
-    attn_matmul_bits: int = 24
-    rope_bits: int = 24
-    # Output
     out: str = ""  # path to .json; sister .md is written next to it
     # Dataset
     dataset: str = "Salesforce/wikitext"
     dataset_config: str | None = "wikitext-103-raw-v1"
     dataset_split: str = "train"
-    # Student mode. "emulated" = fake-quant int via patch_model_int_*
-    # (CPU-friendly, no real hardware path). "fp8-hw" = load a pre-quantized
-    # FP8 checkpoint via HF + compressed_tensors; on Hopper (SM_90+) GPUs the
-    # CompressedLinear modules dispatch through `torch._scaled_mm` for real
-    # FP8 GEMM. The float teacher stays in `--dtype` (bf16 recommended on GPU).
-    student: str = "emulated"
-    student_model: str = ""  # required when student == "fp8-hw"
 
 
 def _baseline_cfg_for_loading(cfg: HarnessConfig) -> BaselineConfig:
@@ -551,54 +534,6 @@ def _baseline_cfg_for_loading(cfg: HarnessConfig) -> BaselineConfig:
     return BaselineConfig(
         model=cfg.model, dtype=cfg.dtype, n_prompts=cfg.n_prompts, max_len=cfg.max_len,
         dataset=cfg.dataset, dataset_config=cfg.dataset_config, dataset_split=cfg.dataset_split,
-    )
-
-
-def build_models(float_model: nn.Module, cfg: HarnessConfig) -> tuple[nn.Module, nn.Module]:
-    """Prepare the float teacher and the low-precision student.
-
-    Two modes selected by `cfg.student`:
-
-      - **emulated** (default): the student is a deepcopy of the float model
-        with `patch_model_int_nonmatmul` + `patch_model_int_cast` applied.
-        Everything runs in fp32/bf16 — no real hardware FP8. Useful for
-        CPU smoke tests and ablations of the int op set.
-
-      - **fp8-hw**: the student is a pre-quantized FP8 checkpoint loaded
-        via HF + compressed_tensors. On Hopper-class GPUs its
-        `CompressedLinear` modules dispatch through `torch._scaled_mm`
-        for a real FP8 GEMM. The teacher is left untouched (whatever
-        `--model` and `--dtype` resolve to). Both sides get the
-        float-eager attention wrap so the softmax / Q@K.T / P@V rows
-        are hookable on both — but note FP8-dynamic doesn't quantize
-        those ops, so we expect near-zero divergence on them, which is
-        itself the real measurement.
-    """
-    if cfg.student == "fp8-hw":
-        return _build_models_fp8_hw(float_model, cfg)
-    if cfg.student == "emulated":
-        return _build_models_emulated(float_model, cfg)
-    raise ValueError(f"unknown --student={cfg.student!r}; expected 'emulated' or 'fp8-hw'")
-
-
-def _build_models_emulated(
-    float_model: nn.Module, cfg: HarnessConfig
-) -> tuple[nn.Module, nn.Module]:
-    ops_cfg = IntOpsConfig(
-        rmsnorm_bits=cfg.rmsnorm_bits,
-        rmsnorm_nr_iter=cfg.rmsnorm_nr_iter,
-        softmax_lut_size=cfg.softmax_lut_size,
-        softmax_x_min=cfg.softmax_x_min,
-        silu_lut_size=cfg.silu_lut_size,
-        attn_matmul_bits=cfg.attn_matmul_bits,
-        rope_bits=cfg.rope_bits,
-    )
-    return prepare_models_for_harness(
-        float_model,
-        ops_cfg,
-        weight_bits=cfg.weight_bits,
-        activation_bits=cfg.activation_bits,
-        include_lm_head=cfg.include_lm_head,
     )
 
 
@@ -633,22 +568,26 @@ class ScaledMmProbe:
         torch._scaled_mm = self._orig
 
 
-def _build_models_fp8_hw(
+def build_models(
     float_model: nn.Module, cfg: HarnessConfig
 ) -> tuple[nn.Module, nn.Module]:
-    """Load a pre-quantized FP8 checkpoint as the student. No fake-quant.
+    """Prepare the bf16 teacher and the real-FP8 student.
 
-    Verifies post-load that at least one `Compressed*` module is present
-    on the student (otherwise the FP8 path silently fell back to fp16/bf16
-    and the harness would be measuring noise, not real quantization).
+    Loads `cfg.student_model` via HF + compressed_tensors, strips the lazy
+    decompress hook so the FP8 weights stay in `torch.float8_e4m3fn`, and
+    swaps every FP8 nn.Linear for an `FP8Linear` whose forward dispatches
+    through `torch._scaled_mm` — a real Hopper FP8 GEMM. Both teacher and
+    student get the float-eager attention wrap so the softmax / Q@K.T / P@V
+    rows are hookable on both. FP8-dynamic doesn't quantize those three
+    ops, so we expect near-zero divergence on them — which is itself the
+    real measurement.
+
+    Raises if the checkpoint doesn't load with FP8 weights, or (downstream
+    via `ScaledMmProbe`) if `torch._scaled_mm` is never called during a
+    forward.
     """
-    from difr_expt.harness_attn_wrap import (
-        force_eager_attn,
-        wrap_all_attention_forwards_float,
-    )
-
     if not cfg.student_model:
-        raise ValueError("`--student-model` is required when --student=fp8-hw")
+        raise ValueError("`--student-model` is required (HF id of a pre-quantized FP8 checkpoint)")
 
     force_eager_attn(float_model)
 
@@ -658,7 +597,7 @@ def _build_models_fp8_hw(
     # fp8_e4m3fn `weight` and a separate `weight_scale` — we strip the
     # hook and swap to FP8Linears (real _scaled_mm) before any forward
     # gets a chance to silently dequantize.
-    print(f"[harness][fp8-hw] loading student {cfg.student_model!r}…")
+    print(f"[harness] loading FP8 student {cfg.student_model!r}…")
     int_model = AutoModelForCausalLM.from_pretrained(cfg.student_model).eval()
     for p in int_model.parameters():
         p.requires_grad = False
@@ -684,7 +623,7 @@ def _build_models_fp8_hw(
             f"that compressed_tensors is installed."
         )
     pre_swap_dtypes = sorted({dt for _, dt in pre_swap})
-    print(f"[harness][fp8-hw] checkpoint has {len(pre_swap)} Linears with low-precision "
+    print(f"[harness] checkpoint has {len(pre_swap)} Linears with low-precision "
           f"weights ({pre_swap_dtypes}); swapping to _scaled_mm FP8Linears now…")
 
     # Strip the lazy-decompress hook + swap every FP8 nn.Linear with an
@@ -699,7 +638,7 @@ def _build_models_fp8_hw(
     )
     disable_compressed_tensors_decompress(int_model)
     n_swapped = replace_compressed_linears_with_fp8(int_model)
-    print(f"[harness][fp8-hw] swapped {n_swapped} compressed Linears → FP8Linear "
+    print(f"[harness] swapped {n_swapped} compressed Linears → FP8Linear "
           f"(real torch._scaled_mm)")
 
     force_eager_attn(int_model)
@@ -710,52 +649,39 @@ def _build_models_fp8_hw(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=HarnessConfig.model)
-    ap.add_argument("--dtype", default=HarnessConfig.dtype, choices=list(DTYPE_MAP.keys()))
+    ap.add_argument("--model", default=HarnessConfig.model,
+                    help="HF repo id of the bf16 teacher")
+    ap.add_argument("--student-model", required=True,
+                    help="HF repo id of the pre-quantized FP8 checkpoint to evaluate")
+    ap.add_argument("--dtype", default=HarnessConfig.dtype, choices=list(DTYPE_MAP.keys()),
+                    help="teacher dtype (bf16 recommended on Hopper)")
     ap.add_argument("--device", default=HarnessConfig.device)
     ap.add_argument("--n-prompts", type=int, default=HarnessConfig.n_prompts)
     ap.add_argument("--max-len", type=int, default=HarnessConfig.max_len)
     ap.add_argument("--seed", type=int, default=HarnessConfig.seed)
-    ap.add_argument("--weight-bits", type=int, default=HarnessConfig.weight_bits)
-    ap.add_argument("--activation-bits", type=int, default=HarnessConfig.activation_bits)
-    ap.add_argument("--rmsnorm-bits", type=int, default=HarnessConfig.rmsnorm_bits)
-    ap.add_argument("--softmax-lut-size", type=int, default=HarnessConfig.softmax_lut_size)
-    ap.add_argument("--silu-lut-size", type=int, default=HarnessConfig.silu_lut_size)
-    ap.add_argument("--attn-matmul-bits", type=int, default=HarnessConfig.attn_matmul_bits)
-    ap.add_argument("--rope-bits", type=int, default=HarnessConfig.rope_bits)
-    ap.add_argument("--no-lm-head", action="store_true",
-                    help="exclude lm_head from int-cast (matches some production recipes)")
-    ap.add_argument("--student", default=HarnessConfig.student,
-                    choices=["emulated", "fp8-hw"],
-                    help="emulated = fake-quant int patchers; fp8-hw = real FP8 checkpoint via compressed_tensors (requires Hopper GPU)")
-    ap.add_argument("--student-model", default=HarnessConfig.student_model,
-                    help="HF repo id of the pre-quantized student (required when --student=fp8-hw)")
-    ap.add_argument("--out", required=True, help="path to results .json; sister .md goes next to it")
+    ap.add_argument("--out", required=True,
+                    help="path to results .json; sister .md goes next to it")
     args = ap.parse_args()
 
     cfg = HarnessConfig(
-        model=args.model, dtype=args.dtype, device=args.device,
+        model=args.model, student_model=args.student_model,
+        dtype=args.dtype, device=args.device,
         n_prompts=args.n_prompts, max_len=args.max_len, seed=args.seed,
-        weight_bits=args.weight_bits, activation_bits=args.activation_bits,
-        rmsnorm_bits=args.rmsnorm_bits, softmax_lut_size=args.softmax_lut_size,
-        silu_lut_size=args.silu_lut_size, attn_matmul_bits=args.attn_matmul_bits,
-        rope_bits=args.rope_bits, include_lm_head=not args.no_lm_head,
-        out=args.out, student=args.student, student_model=args.student_model,
+        out=args.out,
     )
 
-    if cfg.student == "fp8-hw":
-        if not torch.cuda.is_available():
-            raise SystemExit(
-                "--student=fp8-hw requires a CUDA device; this box has none. Run on a "
-                "Hopper-class GPU (H100/H200) where torch._scaled_mm is available."
-            )
-        caps = torch.cuda.get_device_capability(0)
-        if caps < (8, 9):
-            raise SystemExit(
-                f"--student=fp8-hw needs SM_89+ (Ada Lovelace / Hopper / Blackwell); "
-                f"this GPU is SM_{caps[0]}{caps[1]}. FP8 GEMM via torch._scaled_mm "
-                f"is not available."
-            )
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "The FP8 harness requires a CUDA device; this box has none. Run on a "
+            "Hopper-class GPU (H100/H200) where torch._scaled_mm is available."
+        )
+    caps = torch.cuda.get_device_capability(0)
+    if caps < (8, 9):
+        raise SystemExit(
+            f"The FP8 harness needs SM_89+ (Ada Lovelace / Hopper / Blackwell); "
+            f"this GPU is SM_{caps[0]}{caps[1]}. FP8 GEMM via torch._scaled_mm "
+            f"is not available."
+        )
 
     torch.manual_seed(cfg.seed)
     device = pick_device(cfg.device)
@@ -779,45 +705,36 @@ def main():
 
     rows_per_prompt: list[list[ModuleRow]] = []
     logits_per_prompt: list[dict[str, float]] = []
-    fp8_probe: ScaledMmProbe | None = None
-    if cfg.student == "fp8-hw":
-        fp8_probe = ScaledMmProbe()
-        fp8_probe.__enter__()
-    try:
+    with ScaledMmProbe() as fp8_probe:
         for i, ids in enumerate(prompts):
             t0 = time.time()
             ids_t = torch.tensor(ids, dtype=torch.long)
             rows, lm, _, _ = run_one_prompt(float_model, int_model, ids_t, device)
             rows_per_prompt.append(rows)
             logits_per_prompt.append(lm)
-            if cfg.student == "fp8-hw" and i == 0 and fp8_probe is not None:
+            if i == 0:
                 if fp8_probe.count == 0:
                     raise RuntimeError(
                         "FP8 path verification failed: torch._scaled_mm was never called "
                         "during the first forward. The student is not running real FP8 GEMM. "
-                        "Confirm the checkpoint actually has FP8 weights and "
-                        "compressed_tensors picked the scaled_mm path."
+                        "Confirm the checkpoint actually has FP8 weights and the "
+                        "FP8Linear swap completed."
                     )
-                print(f"[harness][fp8-hw] _scaled_mm called {fp8_probe.count} times during "
+                print(f"[harness] _scaled_mm called {fp8_probe.count} times during "
                       f"prompt 0 forward — real FP8 path is live ✓")
             print(f"  prompt {i}: {len(rows)} modules, "
                   f"logit_l2={lm['logit_l2_mean']:.4g}, kl={lm['kl_mean']:.4g}, "
                   f"top1={lm['top1_match']:.3f}, top5={lm['top5_overlap']:.3f} "
                   f"({time.time() - t0:.1f}s)")
-    finally:
-        if fp8_probe is not None:
-            fp8_probe.__exit__(None, None, None)
 
     rows = _accumulate(rows_per_prompt)
     logit_metrics = _aggregate_logits(logits_per_prompt)
 
     header = {
-        "model": cfg.model, "dtype": cfg.dtype, "device": device,
+        "model": cfg.model, "student_model": cfg.student_model,
+        "dtype": cfg.dtype, "device": device,
         "n_prompts": len(prompts), "max_len": cfg.max_len,
-        "weight_bits": cfg.weight_bits, "activation_bits": cfg.activation_bits,
-        "rmsnorm_bits": cfg.rmsnorm_bits, "softmax_lut_size": cfg.softmax_lut_size,
-        "silu_lut_size": cfg.silu_lut_size, "attn_matmul_bits": cfg.attn_matmul_bits,
-        "rope_bits": cfg.rope_bits, "include_lm_head": cfg.include_lm_head,
+        "scaled_mm_calls_prompt0": fp8_probe.count,
     }
 
     out_path = Path(cfg.out)

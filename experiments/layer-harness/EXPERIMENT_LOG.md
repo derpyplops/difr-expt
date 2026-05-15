@@ -99,3 +99,30 @@ Started 2026-05-14. See experiments/layer-harness/plan.md.
   stream. Reports: `reports/fp8-hw-2026-05-15.{md,json}` (4×128)
   and `reports/fp8-hw-n16-2026-05-15.{md,json}` (16×~190). H200
   destroyed after the run.
+- 2026-05-15: Stripped the emulation path from the harness. The
+  emulated student substantially underestimates deployed FP8 error
+  (top-1 = 1.0 vs real FP8's ≈ 0.91 on the same model family), and
+  keeping both modes invited confusion about which one Luke actually
+  cares about. Removed from `src/difr_expt/run_harness.py`: the
+  `--student` flag, all `--weight-bits / --activation-bits /
+  --rmsnorm-bits / --softmax-lut-size / --silu-lut-size /
+  --attn-matmul-bits / --rope-bits / --no-lm-head` CLI knobs, the
+  `_build_models_emulated` helper, and the `IntOpsConfig` import.
+  Removed from `harness_attn_wrap.py`: `rename_int_attn_submodules`
+  and `prepare_models_for_harness` (both emulation-specific) and
+  the `compressed_tensors`-unrelated imports of `IntOpsConfig` /
+  `patch_model_int_nonmatmul` / `patch_model_int_cast` / `copy`.
+  `harness_attn_wrap.py` is now self-contained: it owns its own
+  copy of `ATTENTION_CLASS_NAMES` and `_repeat_kv`. The hardware
+  guard moved out from under the `if cfg.student == "fp8-hw":`
+  block — it's unconditional now. `ScaledMmProbe` is also now
+  unconditional and its call count goes into the result `header`
+  block so the JSON record proves the forward really hit
+  `torch._scaled_mm`. Upstream emulation modules
+  (`src/difr_expt/{int_cast, int_ops, patch_hf_model, fp_quant}.py`)
+  are untouched — they're still used by other experiments
+  (int-residual, int-vs-fp8-ref, baseline-int-cast, etc.). Smoke
+  reports from the emulated mode (`reports/smoke-2026-05-14.{md,json}`)
+  are kept on disk as historical record of the per-named-module
+  hook plumbing, but they reflect a code path that no longer exists
+  in `run_harness.py`.
